@@ -8,14 +8,12 @@ for training and validation as a mat file to be easily loaded later on.
 
 NOTE: Make sure paths have \ at the end
 
-Mercedes Gonzalez. March 2020
-Version control: https://github.gatech.edu/mgonzalez91/pipetteDetectingCNN
+Mercedes Gonzalez. 
 
 %}
 clear all; clc;
 tic
 %% Settings for preprocessing
-NORMALIZE = true;     % average of each image = 0, standard deviation = 1;
 MIRROR_LR = true;           % mirror images across the vertical axis
 MIRROR_UD = true;           % mirror images across the horizontal axis
 MIRROR_LRUD = true;         % do both LR and UD mirroring
@@ -81,18 +79,14 @@ for subfolder_idx = 1:n_folders
 
         % now we append the image and data if the file should be appended
         if exist(abs_filepath, 'file')==2
-%             fprintf('Adding: %s (Complete: %1.2f)',filename,info_idx/length(raw_imds.Files))
             I = customPreprocess(imread(abs_filepath),IMG_SIZE);
             
-%             if NORMALIZE
-%                 I = customPreprocess(I,IMG_SIZE); % normalize and crop for net
                 img_name = strcat(letter{subfolder_idx},'-',filename,'.png');
                 temp_path = fullfile(today_path,img_name);
                 imwrite(I, temp_path);
                 info(info_idx).filepath = temp_path; 
                 info(info_idx).xyz = [log.x(img_idx) log.y(img_idx) log.z(img_idx)];
                 info_idx = info_idx + 1; 
-%             end
             
             if MIRROR_LR
                 I_lr = fliplr(I);  % flip the image
@@ -115,7 +109,6 @@ for subfolder_idx = 1:n_folders
             end
             
             if MIRROR_LRUD
-%                 fprintf('...flipping LRUD\n') 
                 I_lrud = flipud(fliplr(I));  % flip the image
                 lrud_filename = strcat(letter{subfolder_idx},'-',filename,'-LRUD.png');
                 temp_path = fullfile(today_path,lrud_filename);
@@ -124,7 +117,6 @@ for subfolder_idx = 1:n_folders
                 info(info_idx).xyz = [-log.x(img_idx) -log.y(img_idx) log.z(img_idx)];
                 info_idx = info_idx + 1; 
             end
-%             fprintf('...\n')
         end
     end
     
