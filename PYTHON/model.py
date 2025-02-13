@@ -51,3 +51,17 @@ class ModelFactory:
             return ModelFactory.get_resnet50(pretrained)
         else:
             raise ValueError(f"Model '{model_name}' is not supported.")
+        
+    @staticmethod
+    def get_resnet101_single(pretrained=True):
+        """
+        Returns a ResNet101 that outputs ONE value for defocus in microns.
+        """
+        model = models.resnet101(pretrained=pretrained)
+        num_features = model.fc.in_features
+        model.fc = nn.Sequential(
+            nn.Linear(num_features, 512),
+            nn.ReLU(),
+            nn.Linear(512, 1)  # <-- single output
+        )
+        return model
