@@ -3,7 +3,7 @@ import glob
 import random
 import numpy as np
 from PIL import Image
-import custom_process  # Import the custom preprocessing function from custom_process.py
+from customPreprocess import custom_preprocess  # Import the custom preprocessing function from custom_process.py
 import transform  # Import the flipping functions from transform.py
 
 # Directory setup (adjust these paths as needed)
@@ -36,7 +36,7 @@ def process_and_save_images(image_paths, output_dir, augment=True):
         img = Image.open(img_path)
 
         # Apply custom preprocessing (resize and contrast adjustment)
-        processed_img = custom_process.custom_preprocess(np.array(img), IMG_SIZE)
+        processed_img = custom_preprocess.custom_preprocess(np.array(img), IMG_SIZE)
 
         # Save the preprocessed image
         base_name = os.path.basename(img_path)

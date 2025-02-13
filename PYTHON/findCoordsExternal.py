@@ -3,7 +3,7 @@ import time
 import numpy as np
 from PIL import Image
 import matplotlib.pyplot as plt
-import custom_process  # Assuming custom_preprocess function is in custom_process.py
+from customPreprocess import custom_preprocess  # Assuming custom_preprocess function is in custom_process.py
 
 def find_coords_external(image, model=None):
     """
@@ -25,7 +25,7 @@ def find_coords_external(image, model=None):
         image = np.array(image)
     
     # Preprocess image using custom function
-    pipette_img = custom_process.custom_preprocess(image, img_size)
+    pipette_img = custom_preprocess.custom_preprocess(image, img_size)
 
     # Save the temporary image to a folder
     temp_folder = "./temp_images/"
