@@ -2,7 +2,6 @@
 /models/models
 /models/test
 /pipettedata
-
-/checkpoints
 *.pkl
 *.pyc
+/training
