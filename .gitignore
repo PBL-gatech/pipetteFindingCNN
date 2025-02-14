@@ -3,3 +3,6 @@
 /models/test
 /pipettedata
 
+/checkpoints
+*.pkl
+*.pyc
