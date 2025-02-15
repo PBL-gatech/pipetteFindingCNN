@@ -163,7 +163,8 @@ class Trainer:
             shuffle=True, 
             num_workers=16, 
             pin_memory=True, 
-            prefetch_factor=4
+            prefetch_factor=4,
+            persistent_workers=True
         )
         val_loader = DataLoader(
             self.val_dataset, 
@@ -171,7 +172,8 @@ class Trainer:
             shuffle=False, 
             num_workers=16, 
             pin_memory=True, 
-            prefetch_factor=4
+            prefetch_factor=4,
+            persistent_workers=True
         )
         return train_loader, val_loader
 
