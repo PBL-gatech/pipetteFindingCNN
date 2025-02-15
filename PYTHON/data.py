@@ -1,26 +1,31 @@
+#!/usr/bin/env python
 """
 data.py
 ---------
-This module defines the PipetteDataset (a subclass of torch.utils.data.Dataset)
-and a PipetteDataModule class that loads and splits the dataset.
-The dataset is split into 70% training, 20% validation, and 10% testing using a fixed seed.
+Defines a PipetteDataset and a PipetteDataModule for loading and splitting data.
+We create separate datasets for train, val, and test, each with its own Albumentations transform.
+Splits are 70% train, 20% val, 10% test by default.
 """
 
 import os
-import pandas as pd
-import torch
-from torch.utils.data import Dataset, Subset
-from PIL import Image
-from torchvision import transforms
 import random
 import pickle
+import numpy as np
+import pandas as pd
+import torch
+from torch.utils.data import Dataset
+from PIL import Image
+
+# Albumentations
+import albumentations as A
+from albumentations.pytorch import ToTensorV2
 
 class PipetteDataset(Dataset):
     def __init__(self, image_dir, annotations, transform=None):
         """
         image_dir: folder containing images
         annotations: list of tuples (filename, defocus_value)
-        transform: torchvision transforms
+        transform: Albumentations Compose object
         """
         self.image_dir = image_dir
         self.annotations = annotations
@@ -32,22 +37,41 @@ class PipetteDataset(Dataset):
     def __getitem__(self, idx):
         filename, defocus_val = self.annotations[idx]
         image_path = os.path.join(self.image_dir, filename)
-        image = Image.open(image_path).convert('RGB')
+
+        # Load image as PIL and convert to RGB
+        img = Image.open(image_path).convert('RGB')
+        # Convert to np.array for Albumentations
+        img_np = np.array(img)
+
         if self.transform:
-            image = self.transform(image)
-        # Convert scalar to a float32 tensor
+            # Albumentations expects a dict with "image"
+            augmented = self.transform(image=img_np)
+            img_tensor = augmented["image"]
+        else:
+            # Fallback: manual conversion to tensor if no transform is provided
+            img_tensor = torch.from_numpy(img_np).permute(2, 0, 1).float() / 255.0
+
         defocus_tensor = torch.tensor(defocus_val, dtype=torch.float32)
-        return image, defocus_tensor
+        return img_tensor, defocus_tensor
+
 
 class PipetteDataModule:
-    def __init__(self, image_dir, annotation_file, train_split=0.7, val_split=0.2, test_split=0.1, seed=42):
+    def __init__(self, image_dir, annotation_file,
+                 train_split=0.7, val_split=0.2, test_split=0.1,
+                 seed=42,
+                 train_transform=None,
+                 val_transform=None,
+                 test_transform=None):
         """
         image_dir: folder with images
         annotation_file: CSV with columns: filename, defocus_microns
         train_split: fraction of data for training
         val_split: fraction of data for validation
         test_split: fraction of data for testing
-        seed: random seed for reproducibility
+        seed: random seed
+        train_transform: Albumentations transform for training
+        val_transform: Albumentations transform for validation
+        test_transform: Albumentations transform for test
         """
         self.image_dir = image_dir
         self.annotation_file = annotation_file
@@ -55,45 +79,60 @@ class PipetteDataModule:
         self.val_split = val_split
         self.test_split = test_split
         self.seed = seed
-        self.annotations = None
+
+        self.train_transform = train_transform
+        self.val_transform = val_transform
+        self.test_transform = test_transform
+
+        self.annotations = []
         self.train_dataset = None
         self.val_dataset = None
         self.test_dataset = None
 
-    @staticmethod
-    def get_transforms():
-        return transforms.Compose([
-            transforms.Resize((224, 224)),
-            transforms.ToTensor(),
-            transforms.Normalize([0.485, 0.456, 0.406],
-                                 [0.229, 0.224, 0.225])
-        ])
-
     def load_annotations(self):
         df = pd.read_csv(self.annotation_file)
-        self.annotations = []
-        for _, row in df.iterrows():
-            filename = row["filename"]
-            defocus_val = row["defocus_microns"]
-            self.annotations.append((filename, defocus_val))
+        # Expect columns: "filename", "defocus_microns"
+        self.annotations = [(row["filename"], row["defocus_microns"]) for _, row in df.iterrows()]
 
     def setup(self):
         self.load_annotations()
-        transform = self.get_transforms()
-        full_dataset = PipetteDataset(self.image_dir, self.annotations, transform=transform)
-        total_len = len(full_dataset)
+
+        total_len = len(self.annotations)
         indices = list(range(total_len))
         random.seed(self.seed)
         random.shuffle(indices)
+
         train_end = int(total_len * self.train_split)
         val_end = train_end + int(total_len * self.val_split)
+
         train_indices = indices[:train_end]
         val_indices = indices[train_end:val_end]
         test_indices = indices[val_end:]
-        self.train_dataset = Subset(full_dataset, train_indices)
-        self.val_dataset = Subset(full_dataset, val_indices)
-        self.test_dataset = Subset(full_dataset, test_indices)
+
+        # Sub-lists of (filename, defocus_value)
+        train_annot = [self.annotations[i] for i in train_indices]
+        val_annot   = [self.annotations[i] for i in val_indices]
+        test_annot  = [self.annotations[i] for i in test_indices]
+
+        # Create separate datasets
+        self.train_dataset = PipetteDataset(
+            self.image_dir,
+            train_annot,
+            transform=self.train_transform
+        )
+        self.val_dataset = PipetteDataset(
+            self.image_dir,
+            val_annot,
+            transform=self.val_transform
+        )
+        self.test_dataset = PipetteDataset(
+            self.image_dir,
+            test_annot,
+            transform=self.test_transform
+        )
+
         # Save the split indices for reproducibility
         with open("data_splits.pkl", "wb") as f:
             pickle.dump({"train": train_indices, "val": val_indices, "test": test_indices}, f)
+
         return self.train_dataset, self.val_dataset, self.test_dataset

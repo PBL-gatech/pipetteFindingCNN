@@ -6,7 +6,7 @@ import pyqtgraph as pg
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel,
     QPushButton, QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox,
-    QFileDialog, QMessageBox, QTextEdit
+    QFileDialog, QMessageBox, QTextEdit, QGridLayout
 )
 from PyQt5.QtCore import QThread, pyqtSignal
 
@@ -18,8 +18,8 @@ from data import PipetteDataModule
 # Worker thread to run training without blocking the GUI
 # =============================================================================
 class TrainingWorker(QThread):
-    # Signal: (epoch, train_loss, val_loss, f1, mae)
-    update_signal = pyqtSignal(int, float, float, float, float)
+    # Now emitting: epoch, train_loss, val_loss, accuracy, mae, r2
+    update_signal = pyqtSignal(int, float, float, float, float, float)
     finished_signal = pyqtSignal()
     log_signal = pyqtSignal(str)
 
@@ -47,7 +47,6 @@ class TrainingWorker(QThread):
         train_dataset, val_dataset, test_dataset = data_module.setup()
         self.log_signal.emit("Datasets prepared.")
 
-        # Instantiate the trainer using your existing code
         trainer = Trainer(
             model_name=self.model_name,
             train_dataset=train_dataset,
@@ -59,30 +58,26 @@ class TrainingWorker(QThread):
             threshold=self.threshold
         )
 
-        # Create a GradScaler for mixed precision (as in your training code)
         scaler = torch.amp.GradScaler()
         train_loader, val_loader = trainer._get_dataloaders()
         best_val_loss = float('inf')
 
-        # Loop over epochs (this mimics the inner loop of your Trainer.train() method)
         for epoch in range(self.num_epochs):
             self.log_signal.emit(f"Epoch {epoch+1}/{self.num_epochs} started...")
             train_loss = trainer.train_one_epoch(train_loader, scaler)
-            val_loss, f1, mae = trainer.validate(val_loader)
+            # Now validate returns: (val_loss, accuracy, mae, r2)
+            val_loss, accuracy, mae, r2 = trainer.validate(val_loader)
             trainer.train_losses.append(train_loss)
             trainer.val_losses.append(val_loss)
-            trainer.f1_scores.append(f1)
+            trainer.accuracy_scores.append(accuracy)
             trainer.mae_scores.append(mae)
-            # Append the additional metrics so that they match the length of epochs
-            trainer.accuracy_scores.append(f1)
-            trainer.precision_scores.append(f1)
-            trainer.recall_scores.append(f1)
+            trainer.r2_scores.append(r2)
 
             self.log_signal.emit(
-                f"Epoch {epoch+1}: Train Loss={train_loss:.4f}, Val Loss={val_loss:.4f}, F1={f1:.4f}, MAE={mae:.4f}"
+                f"Epoch {epoch+1}: Train Loss={train_loss:.4f}, Val Loss={val_loss:.4f}, "
+                f"Accuracy={accuracy:.4f}, MAE={mae:.4f}, R²={r2:.4f}"
             )
             
-            # Save the model if validation improves
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
                 save_path = os.path.join(trainer.run_folder, f"best_model_focus_{epoch+1}.pth")
@@ -90,14 +85,10 @@ class TrainingWorker(QThread):
                 self.log_signal.emit(f"Saved best model to {save_path}")
 
             trainer.scheduler.step()
-            # Emit a signal with the epoch number and metrics
-            self.update_signal.emit(epoch+1, train_loss, val_loss, f1, mae)
+            self.update_signal.emit(epoch+1, train_loss, val_loss, accuracy, mae, r2)
 
-        
-        # Call the saving function to write training metrics and graphs
         self.log_signal.emit("Saving training metrics and graphs...")
         trainer._save_results()
-        
         self.finished_signal.emit()
 
 
@@ -108,42 +99,47 @@ class TrainingGUI(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Defocus Regression Training GUI")
-        self.resize(1200, 800)  # Adjusted for larger graphs and new layout
+        self.resize(1200, 800)
 
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
         main_layout = QVBoxLayout(central_widget)
 
-        # ----- Top: Graphs in a horizontal layout -----
-        graphs_layout = QHBoxLayout()
+        # ----- Top: Graphs in a grid layout (2x2) -----
+        graphs_layout = QGridLayout()
         self.loss_plot = pg.PlotWidget(title="Training & Validation Loss")
-        self.loss_plot.setFixedSize(600, 600)
-        self.f1_plot = pg.PlotWidget(title="F1 Score")
-        self.f1_plot.setFixedSize(600, 600)
-        self.mae_plot = pg.PlotWidget(title="MAE")
-        self.mae_plot.setFixedSize(600, 600)
-        graphs_layout.addWidget(self.loss_plot)
-        graphs_layout.addWidget(self.f1_plot)
-        graphs_layout.addWidget(self.mae_plot)
+        self.accuracy_plot = pg.PlotWidget(title="Accuracy (± threshold)")
+        self.mae_plot = pg.PlotWidget(title="MAE (µm)")
+        self.r2_plot = pg.PlotWidget(title="R²")
+        self.loss_plot.setFixedSize(400, 400)
+        self.accuracy_plot.setFixedSize(400, 400)
+        self.mae_plot.setFixedSize(400, 400)
+        self.r2_plot.setFixedSize(400, 400)
+        graphs_layout.addWidget(self.loss_plot, 0, 0)
+        graphs_layout.addWidget(self.accuracy_plot, 0, 1)
+        graphs_layout.addWidget(self.mae_plot, 1, 0)
+        graphs_layout.addWidget(self.r2_plot, 1, 1)
         main_layout.addLayout(graphs_layout)
 
         # Create curve objects for plotting
         self.train_loss_curve = self.loss_plot.plot(pen=pg.mkPen('c', width=2))
         self.val_loss_curve = self.loss_plot.plot(pen=pg.mkPen('m', width=2))
-        self.f1_curve = self.f1_plot.plot(pen=pg.mkPen('y', width=2))
+        self.accuracy_curve = self.accuracy_plot.plot(pen=pg.mkPen('y', width=2))
         self.mae_curve = self.mae_plot.plot(pen=pg.mkPen('orange', width=2))
+        self.r2_curve = self.r2_plot.plot(pen=pg.mkPen('lime', width=2))
 
         # Lists to hold the metrics for plotting
         self.epochs = []
         self.train_losses = []
         self.val_losses = []
-        self.f1_scores = []
+        self.accuracy_scores = []
         self.mae_scores = []
+        self.r2_scores = []
 
         # ----- Middle: Scrollable update text area -----
         self.log_text = QTextEdit()
         self.log_text.setReadOnly(True)
-        self.log_text.setFixedHeight(60)  # Half as tall as before
+        self.log_text.setFixedHeight(60)
         main_layout.addWidget(self.log_text)
 
         # ----- Bottom: Editable controls in a single horizontal row -----
@@ -177,7 +173,7 @@ class TrainingGUI(QMainWindow):
 
         # Model selection
         self.model_combo = QComboBox()
-        self.model_combo.addItems(["resnet101", "mobilenetv3", "efficientnet_lite","convnext"])
+        self.model_combo.addItems(["resnet101", "mobilenetv3", "efficientnet_lite", "convnext"])
         model_container = QWidget()
         model_layout = QHBoxLayout(model_container)
         model_layout.setContentsMargins(0, 0, 0, 0)
@@ -223,7 +219,7 @@ class TrainingGUI(QMainWindow):
         self.threshold_spin = QDoubleSpinBox()
         self.threshold_spin.setRange(0.0, 10.0)
         self.threshold_spin.setDecimals(3)
-        self.threshold_spin.setValue(0.1)
+        self.threshold_spin.setValue(0.3)
         threshold_container = QWidget()
         threshold_layout = QHBoxLayout(threshold_container)
         threshold_layout.setContentsMargins(0, 0, 0, 0)
@@ -263,7 +259,6 @@ class TrainingGUI(QMainWindow):
 
     # ---- Start training ----
     def start_training(self):
-        # Validate inputs
         train_dir = self.data_dir_line.text()
         annotations = self.annotations_line.text()
         if not os.path.isdir(train_dir):
@@ -282,11 +277,9 @@ class TrainingGUI(QMainWindow):
         threshold = self.threshold_spin.value()
         device = self.device_combo.currentText()
 
-        # Use a default checkpoint folder (or you could add a selector for this)
         checkpoint_folder = os.path.join(os.getcwd(), "checkpoints")
         os.makedirs(checkpoint_folder, exist_ok=True)
 
-        # Create and start the training worker thread
         self.worker = TrainingWorker(
             model_name, train_dir, annotations, device,
             batch_size, learning_rate, num_epochs, threshold,
@@ -298,25 +291,24 @@ class TrainingGUI(QMainWindow):
         self.worker.start()
 
     # ---- Slots to update plots and logs ----
-    def on_update(self, epoch, train_loss, val_loss, f1, mae):
+    def on_update(self, epoch, train_loss, val_loss, accuracy, mae, r2):
         self.epochs.append(epoch)
         self.train_losses.append(train_loss)
         self.val_losses.append(val_loss)
-        self.f1_scores.append(f1)
+        self.accuracy_scores.append(accuracy)
         self.mae_scores.append(mae)
-        # Update the loss plot (with two curves)
+        self.r2_scores.append(r2)
         self.train_loss_curve.setData(self.epochs, self.train_losses)
         self.val_loss_curve.setData(self.epochs, self.val_losses)
-        # Update F1 and MAE plots
-        self.f1_curve.setData(self.epochs, self.f1_scores)
+        self.accuracy_curve.setData(self.epochs, self.accuracy_scores)
         self.mae_curve.setData(self.epochs, self.mae_scores)
+        self.r2_curve.setData(self.epochs, self.r2_scores)
 
     def on_finished(self):
         self.append_log("Training finished.")
         self.start_button.setEnabled(True)
 
     def append_log(self, message):
-        # Append message to the QTextEdit (with a newline)
         self.log_text.append(message)
 
 # =============================================================================
