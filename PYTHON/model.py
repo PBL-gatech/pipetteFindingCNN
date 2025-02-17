@@ -1,4 +1,4 @@
-# model_regression.py
+# model.py
 import torch.nn as nn
 import timm
 
