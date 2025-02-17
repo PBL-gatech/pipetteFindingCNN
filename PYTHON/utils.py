@@ -1,92 +1,82 @@
+#!/usr/bin/env python
 """
 utils.py
 ----------
-This module contains classes for image preprocessing, data augmentation,
-and visualization.
+This module contains various helper functions for image preprocessing, augmentation,
+and visualization. It now includes the get_train_transform and get_val_transform functions,
+which define your Albumentations augmentation pipelines.
 """
 
 import cv2
 import numpy as np
 from PIL import Image
 import matplotlib.pyplot as plt
+import albumentations as A
+from albumentations.pytorch import ToTensorV2
 
+# ----------------------------
+# Albumentations Transforms
+# ----------------------------
 
-class ImageProcessor:
-    @staticmethod
-    def custom_preprocess(image, image_size=(224, 224)):
-        """
-        Preprocess the image by:
-          - Converting to float and scaling to [0,1]
-          - Center-cropping to a square
-          - Adjusting contrast (clipping to ±2 standard deviations)
-          - Resizing to the target image_size
-          - Converting back to uint8
-        """
-        # If the image is a PIL Image, convert to numpy array.
-        if isinstance(image, Image.Image):
-            image = np.array(image)
-        image = image.astype(np.float32) / 255.0
+def get_train_transform(img_size=224):
+    """
+    Returns an Albumentations Compose transform for training that applies:
+      - Resize to img_size x img_size
+      - Horizontal flip, random 90° rotations, and color jitter
+      - Normalization using ImageNet mean and std
+      - Conversion to a PyTorch tensor
+    """
+    return A.Compose([
+        A.Resize(img_size, img_size),
+        A.HorizontalFlip(p=0.5),
+        A.RandomRotate90(p=0.5),
+        A.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.2),
+        A.Normalize(mean=(0.485, 0.456, 0.406),
+                    std=(0.229, 0.224, 0.225)),
+        ToTensorV2()
+    ])
 
-        ysize, xsize = image.shape[:2]
-        min_dimension = min(xsize, ysize)
-        xmin = (xsize - min_dimension) // 2
-        ymin = (ysize - min_dimension) // 2
-        cropped_image = image[ymin:ymin + min_dimension, xmin:xmin + min_dimension]
+def get_val_transform(img_size=224):
+    """
+    Returns an Albumentations Compose transform for validation/testing that applies:
+      - Resize to img_size x img_size
+      - Normalization using ImageNet mean and std
+      - Conversion to a PyTorch tensor
+    """
+    return A.Compose([
+        A.Resize(img_size, img_size),
+        A.Normalize(mean=(0.485, 0.456, 0.406),
+                    std=(0.229, 0.224, 0.225)),
+        ToTensorV2()
+    ])
 
-        # Adjust contrast based on mean and std deviation.
-        avg = np.mean(cropped_image)
-        sigma = np.std(cropped_image)
-        n = 2
-        min_val = max(0, avg - n * sigma)
-        max_val = min(1, avg + n * sigma)
-        adjusted_image = np.clip((cropped_image - min_val) / (max_val - min_val), 0, 1)
+# ----------------------------
+# Plotting Utilities
+# ----------------------------
 
-        # Resize the image.
-        resized_image = cv2.resize(adjusted_image, image_size, interpolation=cv2.INTER_LINEAR)
-        final_image = (resized_image * 255).astype(np.uint8)
-        return final_image
+def plot_training_metrics(epochs, train_losses, val_losses, save_path):
+    plt.style.use("dark_background")
+    fig, ax = plt.subplots()
+    ax.plot(epochs, train_losses, label="Train Loss", color="cyan", lw=2)
+    ax.plot(epochs, val_losses, label="Val Loss", color="magenta", lw=2)
+    ax.set_title("Training & Validation Loss")
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel("Loss")
+    ax.legend()
+    fig.savefig(save_path)
+    plt.close(fig)
 
-    @staticmethod
-    def transform_lr(image):
-        """
-        Flip the image left-to-right.
-        """
-        return np.fliplr(image)
-
-    @staticmethod
-    def transform_ud(image):
-        """
-        Flip the image up-and-down.
-        """
-        return np.flipud(image)
-
-
-class Visualizer:
-    @staticmethod
-    def visualize_prediction(image, real_coords, pred_coords, marker_size=9):
-        """
-        Visualize the real and predicted coordinates on the image.
-        Draws a circle (cyan) for real_coords and a circle (red) for pred_coords.
-
-        Parameters:
-          image: a PIL Image
-          real_coords: (x, y) tuple for ground truth (if available)
-          pred_coords: (x, y) tuple for prediction
-        """
-        plt.figure()
-        plt.imshow(image)
-        ax = plt.gca()
-
-        # Draw a circle for the real coordinate.
-        real_circle = plt.Circle(real_coords, marker_size, color='cyan',
-                                 fill=False, linewidth=2)
-        ax.add_patch(real_circle)
-
-        # Draw a circle for the predicted coordinate.
-        pred_circle = plt.Circle(pred_coords, marker_size, color='red',
-                                 fill=False, linewidth=2)
-        ax.add_patch(pred_circle)
-
-        plt.title("Real (cyan) vs Predicted (red)")
-        plt.axis('off')
-        plt.show()
+def plot_regression_metrics(epochs, mae_scores, r2_scores, save_path):
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
+    ax1.plot(epochs, mae_scores, label="MAE", color="orange", lw=2)
+    ax1.set_title("Mean Absolute Error Over Epochs")
+    ax1.set_xlabel("Epoch")
+    ax1.set_ylabel("MAE (microns)")
+    ax1.legend()
+    ax2.plot(epochs, r2_scores, label="R²", color="lime", lw=2)
+    ax2.set_title("R² Over Epochs")
+    ax2.set_xlabel("Epoch")
+    ax2.set_ylabel("R²")
+    ax2.legend()
+    fig.savefig(save_path)
+    plt.close(fig)

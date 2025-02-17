@@ -27,17 +27,17 @@ class Inferencer:
         self.mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
         self.std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
 
-    def normalize_z(self, z):
-        """
-        Convert z from [-scale_factor, scale_factor] microns to [-1, 1].
-        """
-        return z / self.scale_factor
+    # def normalize_z(self, z):
+    #     """
+    #     Convert z from [-scale_factor, scale_factor] microns to [-1, 1].
+    #     """
+    #     return z / self.scale_factor
 
-    def denormalize_z(self, z_norm):
-        """
-        Convert normalized z back to microns in [-scale_factor, scale_factor].
-        """
-        return z_norm * self.scale_factor
+    # def denormalize_z(self, z_norm):
+    #     """
+    #     Convert normalized z back to microns in [-scale_factor, scale_factor].
+    #     """
+    #     return z_norm * self.scale_factor
 
     def preprocess(self, img):
         """

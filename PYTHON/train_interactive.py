@@ -6,20 +6,15 @@ import pyqtgraph as pg
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel,
     QPushButton, QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox,
-    QFileDialog, QMessageBox, QTextEdit, QGridLayout
+    QFileDialog, QMessageBox, QTextEdit, QFormLayout
 )
 from PyQt5.QtCore import QThread, pyqtSignal
-
-# Import your training modules (make sure these are in your PYTHONPATH)
-from train import Trainer
+from torch.utils.data import DataLoader
+from train import create_run_folder, get_regression_model, train_and_validate, test_model
 from data import PipetteDataModule
 
-# =============================================================================
-# Worker thread to run training without blocking the GUI
-# =============================================================================
 class TrainingWorker(QThread):
-    # Now emitting: epoch, train_loss, val_loss, accuracy, mae, r2
-    update_signal = pyqtSignal(int, float, float, float, float, float)
+    update_signal = pyqtSignal(int, float, float, float, float)
     finished_signal = pyqtSignal()
     log_signal = pyqtSignal(str)
 
@@ -47,217 +42,131 @@ class TrainingWorker(QThread):
         train_dataset, val_dataset, test_dataset = data_module.setup()
         self.log_signal.emit("Datasets prepared.")
 
-        trainer = Trainer(
-            model_name=self.model_name,
-            train_dataset=train_dataset,
-            val_dataset=val_dataset,
-            device=self.device,
-            batch_size=self.batch_size,
-            learning_rate=self.learning_rate,
-            num_epochs=self.num_epochs,
-            threshold=self.threshold
+        # Build config dictionary and create run folder (which saves config.txt)
+        config = {
+            "model_name": self.model_name,
+            "batch_size": self.batch_size,
+            "learning_rate": self.learning_rate,
+            "num_epochs": self.num_epochs,
+            "threshold": self.threshold,
+            "device": self.device
+        }
+        run_folder = create_run_folder(self.model_name, config=config)
+        self.log_signal.emit(f"Run folder created at: {run_folder}")
+
+        device = torch.device(self.device)
+        model = get_regression_model(model_name=self.model_name, pretrained=True, output_dim=1)
+        model.to(device)
+        self.log_signal.emit("Model created and moved to device.")
+
+        train_loader = DataLoader(train_dataset, batch_size=self.batch_size, shuffle=True, num_workers=8)
+        val_loader = DataLoader(val_dataset, batch_size=self.batch_size, shuffle=False, num_workers=8)
+        test_loader = DataLoader(test_dataset, batch_size=self.batch_size, shuffle=False, num_workers=8)
+
+        def update_callback(epoch, train_loss, val_loss, mae, r2):
+            self.update_signal.emit(epoch, train_loss, val_loss, mae, r2)
+            self.log_signal.emit(
+                f"Epoch {epoch}: Train Loss={train_loss:.4f}, Val Loss={val_loss:.4f}, MAE={mae:.4f}, R²={r2:.4f}"
+            )
+
+        self.log_signal.emit("Starting training...")
+        best_checkpoint, epochs_list, train_losses, val_losses, mae_scores, r2_scores = train_and_validate(
+            model, train_loader, val_loader, device, run_folder,
+            num_epochs=self.num_epochs, update=True, update_callback=update_callback
         )
 
-        scaler = torch.amp.GradScaler()
-        train_loader, val_loader = trainer._get_dataloaders()
-        best_val_loss = float('inf')
-
-        for epoch in range(self.num_epochs):
-            self.log_signal.emit(f"Epoch {epoch+1}/{self.num_epochs} started...")
-            train_loss = trainer.train_one_epoch(train_loader, scaler)
-            # Now validate returns: (val_loss, accuracy, mae, r2)
-            val_loss, accuracy, mae, r2 = trainer.validate(val_loader)
-            trainer.train_losses.append(train_loss)
-            trainer.val_losses.append(val_loss)
-            trainer.accuracy_scores.append(accuracy)
-            trainer.mae_scores.append(mae)
-            trainer.r2_scores.append(r2)
-
-            self.log_signal.emit(
-                f"Epoch {epoch+1}: Train Loss={train_loss:.4f}, Val Loss={val_loss:.4f}, "
-                f"Accuracy={accuracy:.4f}, MAE={mae:.4f}, R²={r2:.4f}"
-            )
-            
-            if val_loss < best_val_loss:
-                best_val_loss = val_loss
-                save_path = os.path.join(trainer.run_folder, f"best_model_focus_{epoch+1}.pth")
-                torch.save(trainer.model.state_dict(), save_path)
-                self.log_signal.emit(f"Saved best model to {save_path}")
-
-            trainer.scheduler.step()
-            self.update_signal.emit(epoch+1, train_loss, val_loss, accuracy, mae, r2)
-        # After the training loop finishes:
-        self.log_signal.emit("Training loop complete. Now testing on the final test set...")
-
-        test_results = trainer.test_model(test_dataset)
-        test_loss, test_acc, test_mae, test_r2 = test_results
-
+        self.log_signal.emit("Training complete. Testing the best model...")
+        model.load_state_dict(torch.load(best_checkpoint))
+        criterion = torch.nn.MSELoss()
+        test_results = test_model(model, test_loader, device, criterion, run_folder)
         self.log_signal.emit(
-            f"Final Test Results:\n"
-            f"Loss={test_loss:.4f}, Acc={test_acc:.4f}, MAE={test_mae:.4f}, R²={test_r2:.4f}"
-)
-
-        self.log_signal.emit("Saving training metrics and graphs...")
-
-        trainer._save_results()
+            f"Final Test Results: Loss={test_results['Test Loss']:.4f}, "
+            f"MAE={test_results['Test MAE']:.4f}, R²={test_results['Test R²']:.4f}"
+        )
         self.finished_signal.emit()
 
-
-# =============================================================================
-# Main GUI window
-# =============================================================================
 class TrainingGUI(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Defocus Regression Training GUI")
-        self.resize(1200, 800)
-
+        self.resize(1000, 700)
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
         main_layout = QVBoxLayout(central_widget)
 
-        # ----- Top: Graphs in a grid layout (2x2) -----
-        graphs_layout = QGridLayout()
-        self.loss_plot = pg.PlotWidget(title="Training & Validation Loss")
-        self.accuracy_plot = pg.PlotWidget(title="Accuracy (± threshold)")
-        self.mae_plot = pg.PlotWidget(title="MAE (µm)")
+        graphs_layout = QHBoxLayout()
+        self.loss_plot = pg.PlotWidget(title="Loss")
+        self.mae_plot = pg.PlotWidget(title="MAE")
         self.r2_plot = pg.PlotWidget(title="R²")
-        self.loss_plot.setFixedSize(400, 400)
-        self.accuracy_plot.setFixedSize(400, 400)
-        self.mae_plot.setFixedSize(400, 400)
-        self.r2_plot.setFixedSize(400, 400)
-        graphs_layout.addWidget(self.loss_plot, 0, 0)
-        graphs_layout.addWidget(self.accuracy_plot, 0, 1)
-        graphs_layout.addWidget(self.mae_plot, 1, 0)
-        graphs_layout.addWidget(self.r2_plot, 1, 1)
+        graphs_layout.addWidget(self.loss_plot)
+        graphs_layout.addWidget(self.mae_plot)
+        graphs_layout.addWidget(self.r2_plot)
         main_layout.addLayout(graphs_layout)
 
-        # Create curve objects for plotting
-        self.train_loss_curve = self.loss_plot.plot(pen=pg.mkPen('c', width=2))
-        self.val_loss_curve = self.loss_plot.plot(pen=pg.mkPen('m', width=2))
-        self.accuracy_curve = self.accuracy_plot.plot(pen=pg.mkPen('y', width=2))
-        self.mae_curve = self.mae_plot.plot(pen=pg.mkPen('orange', width=2))
-        self.r2_curve = self.r2_plot.plot(pen=pg.mkPen('lime', width=2))
-
-        # Lists to hold the metrics for plotting
-        self.epochs = []
-        self.train_losses = []
-        self.val_losses = []
-        self.accuracy_scores = []
-        self.mae_scores = []
-        self.r2_scores = []
-
-        # ----- Middle: Scrollable update text area -----
         self.log_text = QTextEdit()
         self.log_text.setReadOnly(True)
-        self.log_text.setFixedHeight(60)
         main_layout.addWidget(self.log_text)
 
-        # ----- Bottom: Editable controls in a single horizontal row -----
-        controls_layout = QHBoxLayout()
-
-        # Training Images Directory: label, line edit, and browse button
+        controls_form = QFormLayout()
         self.data_dir_line = QLineEdit()
-        self.data_dir_line.setPlaceholderText("Select images directory")
-        data_dir_button = QPushButton("Browse")
-        data_dir_button.clicked.connect(self.select_data_dir)
-        data_dir_container = QWidget()
-        data_dir_container_layout = QHBoxLayout(data_dir_container)
-        data_dir_container_layout.setContentsMargins(0, 0, 0, 0)
-        data_dir_container_layout.addWidget(QLabel("Images Dir:"))
-        data_dir_container_layout.addWidget(self.data_dir_line)
-        data_dir_container_layout.addWidget(data_dir_button)
-        controls_layout.addWidget(data_dir_container)
+        browse_data_btn = QPushButton("Browse")
+        browse_data_btn.clicked.connect(self.select_data_dir)
+        data_hbox = QHBoxLayout()
+        data_hbox.addWidget(self.data_dir_line)
+        data_hbox.addWidget(browse_data_btn)
+        controls_form.addRow("Images Dir:", data_hbox)
 
-        # Annotations CSV: label, line edit, and browse button
         self.annotations_line = QLineEdit()
-        self.annotations_line.setPlaceholderText("Select annotations CSV")
-        annotations_button = QPushButton("Browse")
-        annotations_button.clicked.connect(self.select_annotations)
-        annotations_container = QWidget()
-        annotations_container_layout = QHBoxLayout(annotations_container)
-        annotations_container_layout.setContentsMargins(0, 0, 0, 0)
-        annotations_container_layout.addWidget(QLabel("Annotations:"))
-        annotations_container_layout.addWidget(self.annotations_line)
-        annotations_container_layout.addWidget(annotations_button)
-        controls_layout.addWidget(annotations_container)
+        browse_ann_btn = QPushButton("Browse")
+        browse_ann_btn.clicked.connect(self.select_annotations)
+        ann_hbox = QHBoxLayout()
+        ann_hbox.addWidget(self.annotations_line)
+        ann_hbox.addWidget(browse_ann_btn)
+        controls_form.addRow("Annotations CSV:", ann_hbox)
 
-        # Model selection
         self.model_combo = QComboBox()
-        self.model_combo.addItems(["resnet101", "mobilenetv3", "efficientnet_lite", "convnext"])
-        model_container = QWidget()
-        model_layout = QHBoxLayout(model_container)
-        model_layout.setContentsMargins(0, 0, 0, 0)
-        model_layout.addWidget(QLabel("Model:"))
-        model_layout.addWidget(self.model_combo)
-        controls_layout.addWidget(model_container)
+        self.model_combo.addItems(["mobilenetv3_large_100"])
+        controls_form.addRow("Model:", self.model_combo)
 
-        # Number of epochs
         self.epochs_spin = QSpinBox()
         self.epochs_spin.setRange(1, 1000)
         self.epochs_spin.setValue(50)
-        epochs_container = QWidget()
-        epochs_layout = QHBoxLayout(epochs_container)
-        epochs_layout.setContentsMargins(0, 0, 0, 0)
-        epochs_layout.addWidget(QLabel("Epochs:"))
-        epochs_layout.addWidget(self.epochs_spin)
-        controls_layout.addWidget(epochs_container)
+        controls_form.addRow("Epochs:", self.epochs_spin)
 
-        # Batch size
         self.batch_size_spin = QSpinBox()
         self.batch_size_spin.setRange(1, 1024)
         self.batch_size_spin.setValue(32)
-        batch_container = QWidget()
-        batch_layout = QHBoxLayout(batch_container)
-        batch_layout.setContentsMargins(0, 0, 0, 0)
-        batch_layout.addWidget(QLabel("Batch:"))
-        batch_layout.addWidget(self.batch_size_spin)
-        controls_layout.addWidget(batch_container)
+        controls_form.addRow("Batch Size:", self.batch_size_spin)
 
-        # Learning rate
         self.learning_rate_spin = QDoubleSpinBox()
-        self.learning_rate_spin.setRange(1e-6, 1.0)
         self.learning_rate_spin.setDecimals(6)
+        self.learning_rate_spin.setRange(1e-6, 1.0)
         self.learning_rate_spin.setValue(1e-4)
-        lr_container = QWidget()
-        lr_layout = QHBoxLayout(lr_container)
-        lr_layout.setContentsMargins(0, 0, 0, 0)
-        lr_layout.addWidget(QLabel("LR:"))
-        lr_layout.addWidget(self.learning_rate_spin)
-        controls_layout.addWidget(lr_container)
+        controls_form.addRow("Learning Rate:", self.learning_rate_spin)
 
-        # Threshold
         self.threshold_spin = QDoubleSpinBox()
-        self.threshold_spin.setRange(0.0, 10.0)
         self.threshold_spin.setDecimals(3)
+        self.threshold_spin.setRange(0.0, 10.0)
         self.threshold_spin.setValue(0.3)
-        threshold_container = QWidget()
-        threshold_layout = QHBoxLayout(threshold_container)
-        threshold_layout.setContentsMargins(0, 0, 0, 0)
-        threshold_layout.addWidget(QLabel("Thresh:"))
-        threshold_layout.addWidget(self.threshold_spin)
-        controls_layout.addWidget(threshold_container)
+        controls_form.addRow("Threshold:", self.threshold_spin)
 
-        # Device selection
         self.device_combo = QComboBox()
         self.device_combo.addItems(["cuda", "cpu"])
-        device_container = QWidget()
-        device_layout = QHBoxLayout(device_container)
-        device_layout.setContentsMargins(0, 0, 0, 0)
-        device_layout.addWidget(QLabel("Device:"))
-        device_layout.addWidget(self.device_combo)
-        controls_layout.addWidget(device_container)
+        controls_form.addRow("Device:", self.device_combo)
 
-        # Start training button
         self.start_button = QPushButton("Start Training")
         self.start_button.clicked.connect(self.start_training)
-        controls_layout.addWidget(self.start_button)
+        controls_form.addRow(self.start_button)
 
-        main_layout.addLayout(controls_layout)
+        main_layout.addLayout(controls_form)
 
+        self.epochs = []
+        self.train_losses = []
+        self.val_losses = []
+        self.mae_scores = []
+        self.r2_scores = []
         self.worker = None
 
-    # ---- File selection callbacks ----
     def select_data_dir(self):
         directory = QFileDialog.getExistingDirectory(self, "Select Training Images Directory", "")
         if directory:
@@ -268,7 +177,6 @@ class TrainingGUI(QMainWindow):
         if file_path:
             self.annotations_line.setText(file_path)
 
-    # ---- Start training ----
     def start_training(self):
         train_dir = self.data_dir_line.text()
         annotations = self.annotations_line.text()
@@ -301,19 +209,19 @@ class TrainingGUI(QMainWindow):
         self.worker.log_signal.connect(self.append_log)
         self.worker.start()
 
-    # ---- Slots to update plots and logs ----
-    def on_update(self, epoch, train_loss, val_loss, accuracy, mae, r2):
+    def on_update(self, epoch, train_loss, val_loss, mae, r2):
         self.epochs.append(epoch)
         self.train_losses.append(train_loss)
         self.val_losses.append(val_loss)
-        self.accuracy_scores.append(accuracy)
         self.mae_scores.append(mae)
         self.r2_scores.append(r2)
-        self.train_loss_curve.setData(self.epochs, self.train_losses)
-        self.val_loss_curve.setData(self.epochs, self.val_losses)
-        self.accuracy_curve.setData(self.epochs, self.accuracy_scores)
-        self.mae_curve.setData(self.epochs, self.mae_scores)
-        self.r2_curve.setData(self.epochs, self.r2_scores)
+        self.loss_plot.clear()
+        self.loss_plot.plot(self.epochs, self.train_losses, pen='c', name="Train Loss")
+        self.loss_plot.plot(self.epochs, self.val_losses, pen='m', name="Val Loss")
+        self.mae_plot.clear()
+        self.mae_plot.plot(self.epochs, self.mae_scores, pen=pg.mkPen('orange', width=2))
+        self.r2_plot.clear()
+        self.r2_plot.plot(self.epochs, self.r2_scores, pen=pg.mkPen('lime', width=2))
 
     def on_finished(self):
         self.append_log("Training finished.")
@@ -322,9 +230,6 @@ class TrainingGUI(QMainWindow):
     def append_log(self, message):
         self.log_text.append(message)
 
-# =============================================================================
-# Run the application
-# =============================================================================
 if __name__ == '__main__':
     app = QApplication(sys.argv)
     window = TrainingGUI()
