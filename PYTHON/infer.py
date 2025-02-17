@@ -7,13 +7,13 @@ import onnxruntime as ort
 from pathlib import Path
 
 class Inferencer:
-    def __init__(self, scale_factor=40.0):
+    def __init__(self):
         # Set the scale factor as an instance attribute
-        self.scale_factor = scale_factor
+   
         
         # Determine the model path
         cur_dir = Path(__file__).parent.absolute()
-        model_path = os.path.join(cur_dir, 'python_models', 'pipette_focus_model.onnx')
+        model_path = os.path.join(cur_dir, 'python_models', 'regression_model2.onnx')
         
         # Initialize ONNX Runtime session
         self.session = ort.InferenceSession(model_path)
@@ -26,18 +26,6 @@ class Inferencer:
         # Mean and std used in training (from Albumentations normalization)
         self.mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
         self.std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
-
-    # def normalize_z(self, z):
-    #     """
-    #     Convert z from [-scale_factor, scale_factor] microns to [-1, 1].
-    #     """
-    #     return z / self.scale_factor
-
-    # def denormalize_z(self, z_norm):
-    #     """
-    #     Convert normalized z back to microns in [-scale_factor, scale_factor].
-    #     """
-    #     return z_norm * self.scale_factor
 
     def preprocess(self, img):
         """
@@ -72,11 +60,11 @@ class Inferencer:
         return pred_microns
 
 if __name__ == '__main__':
-    focuser = Inferencer(scale_factor=40.0)
+    focuser = Inferencer()
     
     # Adjust image path as needed
     cur_dir = Path(__file__).parent.absolute()
-    image_path = os.path.join(cur_dir, "example_images", "142152_1739486176.315333.webp")
+    image_path = os.path.join(cur_dir, "example_images", "0_focus.png")
     
     if not os.path.exists(image_path):
         print(f"Image not found: {image_path}")
