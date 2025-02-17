@@ -86,8 +86,19 @@ class TrainingWorker(QThread):
 
             trainer.scheduler.step()
             self.update_signal.emit(epoch+1, train_loss, val_loss, accuracy, mae, r2)
+        # After the training loop finishes:
+        self.log_signal.emit("Training loop complete. Now testing on the final test set...")
+
+        test_results = trainer.test_model(test_dataset)
+        test_loss, test_acc, test_mae, test_r2 = test_results
+
+        self.log_signal.emit(
+            f"Final Test Results:\n"
+            f"Loss={test_loss:.4f}, Acc={test_acc:.4f}, MAE={test_mae:.4f}, R²={test_r2:.4f}"
+)
 
         self.log_signal.emit("Saving training metrics and graphs...")
+
         trainer._save_results()
         self.finished_signal.emit()
 

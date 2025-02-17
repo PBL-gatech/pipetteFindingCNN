@@ -5,3 +5,5 @@
 *.pkl
 *.pyc
 /training
+/PYTHON/example_images
+PYTHON/python_models/pipette_focus_model.onnx

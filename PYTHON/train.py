@@ -99,7 +99,7 @@ def compute_r2(preds, targets):
 ###############################################################################
 class Trainer:
     def __init__(self, model_name, train_dataset, val_dataset, device='cuda',
-                 batch_size=32, learning_rate=1e-4, num_epochs=50, threshold=0.3,
+                 batch_size=16, learning_rate=1e-4, num_epochs=50, threshold=0.3,
                  min_delta=0.005, patience=15):
         self.device = torch.device(device if torch.cuda.is_available() else 'cpu')
         logging.info("Using CUDA" if torch.cuda.is_available() else "CUDA not available")
@@ -161,7 +161,7 @@ class Trainer:
             self.train_dataset, 
             batch_size=self.batch_size,
             shuffle=True, 
-            num_workers=16, 
+            num_workers=8, 
             pin_memory=True, 
             prefetch_factor=4,
             persistent_workers=True
@@ -170,7 +170,7 @@ class Trainer:
             self.val_dataset, 
             batch_size=self.batch_size,
             shuffle=False, 
-            num_workers=16, 
+            num_workers=8, 
             pin_memory=True, 
             prefetch_factor=4,
             persistent_workers=True
@@ -352,7 +352,78 @@ class Trainer:
             logging.info(f"Training metrics saved at {metrics_path}")
         except Exception as e:
             logging.error(f"Error saving results: {e}")
+    
+    def test_model(self, test_dataset,best_model="best_model.pth"):
+            """
+            Loads the best_model.pth (if it exists) or current_model.pth,
+            then evaluates on the given test_dataset. Returns (loss, acc, mae, r2).
+            """
 
+            # 1) Load best or current model
+            if best_model is None:
+                best_model = "current_model.pth"
+            best_model_path = os.path.join(self.run_folder,best_model)
+            if os.path.exists(best_model_path):
+                self.model.load_state_dict(torch.load(best_model_path))
+                logging.info("Loaded best model for final testing.")
+            else:
+                logging.error(f"Model not found at {best_model_path}.")
+                return None
+            self.model.eval()
+
+            # 2) Create DataLoader for the test set
+            test_loader = DataLoader(
+                test_dataset,
+                batch_size=self.batch_size,
+                shuffle=False,
+                num_workers=8,
+                pin_memory=True
+            )
+
+            test_loss = 0.0
+            all_test_preds_real = []
+            all_test_targets_real = []
+
+            with torch.no_grad():
+                for images, targets in tqdm(test_loader, desc="Testing"):
+                    images = images.to(self.device, non_blocking=True)
+                    targets_real = targets.to(self.device, non_blocking=True).float()
+                    targets_norm = normalize_z(targets_real)
+
+                    preds_norm = self.model(images).squeeze(1)
+                    loss = self.criterion(preds_norm, targets_norm)
+                    test_loss += loss.item() * images.size(0)
+
+                    # Convert predictions back to microns
+                    preds_real = denormalize_z(preds_norm)
+                    all_test_preds_real.append(preds_real)
+                    all_test_targets_real.append(targets_real)
+
+            avg_test_loss = test_loss / len(test_loader.dataset)
+            all_test_preds_real = torch.cat(all_test_preds_real)
+            all_test_targets_real = torch.cat(all_test_targets_real)
+
+            # Compute your metrics
+            test_acc = compute_accuracy_within_threshold(all_test_preds_real, all_test_targets_real, threshold=self.threshold)
+            test_mae = compute_mae(all_test_preds_real, all_test_targets_real)
+            test_r2 = compute_r2(all_test_preds_real, all_test_targets_real)
+
+            msg = (
+                f"Test Loss (MSE in normalized space): {avg_test_loss:.4f}\n"
+                f"Test Accuracy ±{self.threshold}µm: {test_acc:.4f}\n"
+                f"Test MAE (µm): {test_mae:.4f}\n"
+                f"Test R^2: {test_r2:.4f}"
+            )
+            logging.info(msg)
+
+            # Optionally save results
+            test_results_path = os.path.join(self.run_folder, "test_results.txt")
+            with open(test_results_path, "w") as f:
+                f.write(msg)
+            logging.info(f"Test results saved at {test_results_path}")
+
+            # Return them if you want to display in your GUI
+            return avg_test_loss, test_acc, test_mae, test_r2
 ###############################################################################
 # Main: For Standalone CLI
 ###############################################################################
