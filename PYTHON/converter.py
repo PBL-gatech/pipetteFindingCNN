@@ -35,7 +35,7 @@ def convert_to_onnx(checkpoint_path, onnx_path, model_name="mobilenetv3_large_10
 
 if __name__ == "__main__":
     # Update these paths as appropriate for your environment.
-    checkpoint_path = os.path.join(r"C:\Users\sa-forest\Documents\GitHub\pipetteFindingCNN\training\train-mobilenetv3_large_100-20250217_171822", "best_model_focus_epoch18.pth")
-    onnx_path = os.path.join(r"C:\Users\sa-forest\Documents\GitHub\pipetteFindingCNN\training\train-mobilenetv3_large_100-20250217_171822", "regression_model2.onnx")
+    checkpoint_path = os.path.join(r'C:\Users\sa-forest\Documents\GitHub\pipetteFindingCNN\training\train-mobilenetv3_large_100-20250929_152042', "best_model_focus_epoch48.pth")
+    onnx_path = os.path.join(r"C:\Users\sa-forest\Documents\GitHub\pipetteFindingCNN\training\train-mobilenetv3_large_100-20250929_152042", "BoPipetteFocuserNet.onnx")
     
     convert_to_onnx(checkpoint_path, onnx_path)
