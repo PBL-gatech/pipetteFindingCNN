@@ -53,7 +53,9 @@ def train_and_validate(model, train_loader, val_loader, device, run_folder, num_
             targets = targets.to(device)
             optimizer.zero_grad()
             with torch.amp.autocast(enabled=(scaler is not None),device_type='cuda'):
-                outputs = model(images).squeeze(1)
+                outputs = model(images)
+                if targets.ndim == 1:
+                    targets = targets.unsqueeze(1)
                 loss = criterion(outputs, targets)
             if scaler:
                 scaler.scale(loss).backward()
@@ -75,7 +77,9 @@ def train_and_validate(model, train_loader, val_loader, device, run_folder, num_
                 images = images.to(device)
                 targets = targets.to(device)
                 with torch.amp.autocast(enabled=(scaler is not None),device_type='cuda'):
-                    outputs = model(images).squeeze(1)
+                    outputs = model(images)
+                    if targets.ndim == 1:
+                        targets = targets.unsqueeze(1)
                     loss = criterion(outputs, targets)
                 val_running_loss += loss.item() * images.size(0)
                 all_preds.append(outputs.cpu())
@@ -85,9 +89,12 @@ def train_and_validate(model, train_loader, val_loader, device, run_folder, num_
 
         preds = torch.cat(all_preds)
         targets_cat = torch.cat(all_targets)
-        mae = torch.mean(torch.abs(preds - targets_cat)).item()
-        ss_res = torch.sum((targets_cat - preds)**2)
-        ss_tot = torch.sum((targets_cat - torch.mean(targets_cat))**2) + 1e-8
+        preds_flat = preds.view(preds.size(0), -1)
+        targets_flat = targets_cat.view(targets_cat.size(0), -1)
+        mae = torch.mean(torch.abs(preds_flat - targets_flat)).item()
+        ss_res = torch.sum((targets_flat - preds_flat)**2)
+        mean_targets = torch.mean(targets_flat, dim=0)
+        ss_tot = torch.sum((targets_flat - mean_targets)**2) + 1e-8
         r2 = 1 - ss_res / ss_tot
 
         mae_scores.append(mae)
@@ -121,7 +128,9 @@ def test_model(model, test_loader, device, criterion, run_folder):
         for images, targets in test_loader:
             images = images.to(device)
             targets = targets.to(device)
-            outputs = model(images).squeeze(1)
+            outputs = model(images)
+            if targets.ndim == 1:
+                targets = targets.unsqueeze(1)
             loss = criterion(outputs, targets)
             test_loss += loss.item() * images.size(0)
             all_preds.append(outputs.cpu())
@@ -129,9 +138,12 @@ def test_model(model, test_loader, device, criterion, run_folder):
     test_loss /= len(test_loader.dataset)
     preds = torch.cat(all_preds)
     targets_cat = torch.cat(all_targets)
-    mae = torch.mean(torch.abs(preds - targets_cat)).item()
-    ss_res = torch.sum((targets_cat - preds)**2)
-    ss_tot = torch.sum((targets_cat - torch.mean(targets_cat))**2) + 1e-8
+    preds_flat = preds.view(preds.size(0), -1)
+    targets_flat = targets_cat.view(targets_cat.size(0), -1)
+    mae = torch.mean(torch.abs(preds_flat - targets_flat)).item()
+    ss_res = torch.sum((targets_flat - preds_flat)**2)
+    mean_targets = torch.mean(targets_flat, dim=0)
+    ss_tot = torch.sum((targets_flat - mean_targets)**2) + 1e-8
     r2 = 1 - ss_res/ss_tot
     results = {"Test Loss": test_loss, "Test MAE": mae, "Test R²": r2.item()}
     with open(os.path.join(run_folder, "test_results.txt"), "w") as f:
@@ -157,6 +169,7 @@ if __name__ == '__main__':
         test_transform=get_val_transform(img_size=224)
     )
     train_dataset, val_dataset, test_dataset = data_module.setup()
+    output_dim = data_module.target_dim
     
     model_name = "mobilenetv3_large_100"
     config = {
@@ -165,12 +178,13 @@ if __name__ == '__main__':
         "learning_rate": 1e-4,
         "num_epochs": 50,
         "threshold": 0.3,
-        "device": "cuda" if torch.cuda.is_available() else "cpu"
+        "device": "cuda" if torch.cuda.is_available() else "cpu",
+        "output_dim": output_dim
     }
     run_folder = create_run_folder(model_name, config=config)
     print("Run folder created at:", run_folder)
     
-    model = get_regression_model(model_name=model_name, pretrained=True, output_dim=1)
+    model = get_regression_model(model_name=model_name, pretrained=True, output_dim=output_dim)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
     

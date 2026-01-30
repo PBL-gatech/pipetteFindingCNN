@@ -3,35 +3,51 @@
 evaluation.py
 -------------
 Evaluates a previously trained model on the test set, using the same
-random splits and seed as training, but without retraining.
+random splits and seed as training, but without retraining. Supports 1–3
+regression outputs (x, y, z) based on the annotation columns.
 """
 
+import glob
 import logging
 import os
 
 import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader
 
-# Import your data module and Trainer
 from data import PipetteDataModule
-from train import Trainer  # Trainer must have the 'test_model' method
+from model import get_regression_model
+from train import test_model
+
+
+def _pick_checkpoint(run_folder, checkpoint_name=None):
+    if checkpoint_name:
+        candidate = os.path.join(run_folder, checkpoint_name)
+        if os.path.isfile(candidate):
+            return candidate
+    pattern = os.path.join(run_folder, "best_model*.pth")
+    matches = sorted(glob.glob(pattern), key=os.path.getmtime, reverse=True)
+    if not matches:
+        raise FileNotFoundError(f"No checkpoint found in {run_folder}")
+    return matches[0]
+
 
 def evaluate_trained_model(
     run_folder,
     images_dir,
     annotations_csv,
-    model_name="mobilenetv3",
+    model_name="mobilenetv3_large_100",
     device="cuda",
     batch_size=32,
-    threshold=0.3,
-    seed=42
+    seed=42,
+    checkpoint_name=None
 ):
     """
-    Evaluates the model saved in `run_folder` (best_model.pth or current_model.pth)
-    on the test split of your dataset. The dataset is re-split with the same seed,
-    so you get the exact same test set as in training.
+    Evaluates the model saved in `run_folder` on the test split of your dataset.
+    The dataset is re-split with the same seed, so you get the exact same test set as in training.
     """
 
-    logging.info("Setting up data module with train_split=0.7, val_split=0.2, test_split=0.1")
+    logging.info("Setting up data module with test_split=1.0 for evaluation")
     data_module = PipetteDataModule(
         image_dir=images_dir,
         annotation_file=annotations_csv,
@@ -40,38 +56,34 @@ def evaluate_trained_model(
         test_split=1.0,
         seed=seed
     )
-    # This replicates the same splits & random seed as in training
     _, _, test_dataset = data_module.setup()
+    output_dim = data_module.target_dim
 
-    # Create a Trainer object (won't actually train—just for loading/checkpoint & testing)
-    trainer = Trainer(
-        model_name=model_name,
-        train_dataset=None,   # Not needed for evaluation
-        val_dataset=None,     # Not needed for evaluation
-        device=device,
-        batch_size=batch_size,
-        learning_rate=1e-4,   # Not used here, but required
-        num_epochs=1,         # Not used here
-        threshold=threshold
-    )
+    ckpt_path = _pick_checkpoint(run_folder, checkpoint_name)
+    logging.info(f"Loading checkpoint: {ckpt_path}")
 
-    # Point the Trainer to the folder that has best_model.pth/current_model.pth
-    trainer.run_folder = run_folder
+    model = get_regression_model(model_name=model_name, pretrained=False, output_dim=output_dim)
+    model.load_state_dict(torch.load(ckpt_path, map_location=device))
+    model.to(device)
+
+    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=4)
+    criterion = nn.MSELoss()
 
     logging.info("Evaluating best model on the test set...")
-    test_loss, test_acc, test_mae, test_r2 = trainer.test_model(test_dataset,best_model="best_model_focus_22.pth")
+    results = test_model(model, test_loader, device, criterion, run_folder)
 
     logging.info("Done evaluating!")
-    logging.info(f"Test Loss (MSE in normalized space): {test_loss:.4f}")
-    logging.info(f"Test Accuracy ±{threshold}µm:       {test_acc:.4f}")
-    logging.info(f"Test MAE (µm):                      {test_mae:.4f}")
-    logging.info(f"Test R²:                             {test_r2:.4f}")
+    logging.info(f"Test Loss (MSE): {results['Test Loss']:.4f}")
+    logging.info(f"Test MAE:        {results['Test MAE']:.4f}")
+    logging.info(f"Test RÂ²:        {results['Test RÂ²']:.4f}")
+    return results
+
 
 if __name__ == "__main__":
     # You can adjust these paths/values as needed
     logging.basicConfig(level=logging.INFO)
 
-    run_folder = r"C:\Users\sa-forest\Documents\GitHub\pipetteFindingCNN\training\train-mobilenetv3-20250215_160856"  # Folder where best_model.pth is saved
+    run_folder = r"C:\Users\sa-forest\Documents\GitHub\pipetteFindingCNN\training\train-mobilenetv3-20250215_160856"  # Folder where best_model*.pth is saved
     images_dir = r"C:\Users\sa-forest\Documents\GitHub\pipetteFindingCNN\pipettedata\20191016"                           # Same images used in training
     annotations_csv = r"C:\Users\sa-forest\Documents\GitHub\pipetteFindingCNN\pipettedata\processed_20191016_final.csv"             # Same CSV used in training
 
@@ -79,9 +91,8 @@ if __name__ == "__main__":
         run_folder=run_folder,
         images_dir=images_dir,
         annotations_csv=annotations_csv,
-        model_name="mobilenetv3",
+        model_name="mobilenetv3_large_100",
         device="cuda",
         batch_size=16,
-        threshold=0.5,
         seed=42
     )

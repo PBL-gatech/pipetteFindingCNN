@@ -40,6 +40,7 @@ class TrainingWorker(QThread):
             train_split=0.7, val_split=0.2, test_split=0.1, seed=42
         )
         train_dataset, val_dataset, test_dataset = data_module.setup()
+        output_dim = data_module.target_dim
         self.log_signal.emit("Datasets prepared.")
 
         # Build config dictionary and create run folder (which saves config.txt)
@@ -49,13 +50,14 @@ class TrainingWorker(QThread):
             "learning_rate": self.learning_rate,
             "num_epochs": self.num_epochs,
             "threshold": self.threshold,
-            "device": self.device
+            "device": self.device,
+            "output_dim": output_dim
         }
         run_folder = create_run_folder(self.model_name, config=config)
         self.log_signal.emit(f"Run folder created at: {run_folder}")
 
         device = torch.device(self.device)
-        model = get_regression_model(model_name=self.model_name, pretrained=True, output_dim=1)
+        model = get_regression_model(model_name=self.model_name, pretrained=True, output_dim=output_dim)
         model.to(device)
         self.log_signal.emit("Model created and moved to device.")
 
