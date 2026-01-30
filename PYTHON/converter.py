@@ -34,8 +34,12 @@ def convert_to_onnx(checkpoint_path, onnx_path, model_name="mobilenetv3_large_10
     print(f"Regression model successfully exported to {onnx_path}")
 
 if __name__ == "__main__":
+    checkpoint_name = r"C:\Users\sa-forest\Documents\GitHub\pipetteFindingCNN\training\train-mobilenetv3_large_100-20260121_022553"
+    model_name = "best_model_focus_epoch38.pth"
+    onnx_name = "WaynesBoroPipetteFocuserNet.onnx"
     # Update these paths as appropriate for your environment.
-    checkpoint_path = os.path.join(r'C:\Users\sa-forest\Documents\GitHub\pipetteFindingCNN\training\train-mobilenetv3_large_100-20250929_152042', "best_model_focus_epoch48.pth")
-    onnx_path = os.path.join(r"C:\Users\sa-forest\Documents\GitHub\pipetteFindingCNN\training\train-mobilenetv3_large_100-20250929_152042", "BoPipetteFocuserNet.onnx")
+ 
+    checkpoint_path = os.path.join(checkpoint_name, model_name)
+    onnx_path = os.path.join(os.path.dirname(checkpoint_path), onnx_name)
     
     convert_to_onnx(checkpoint_path, onnx_path)
