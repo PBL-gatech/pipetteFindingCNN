@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+﻿#!/usr/bin/env python
 """
 utils.py
 ----------
@@ -21,15 +21,13 @@ from albumentations.pytorch import ToTensorV2
 def get_train_transform(img_size=224, use_keypoints=False, flip_p=0.5, rotate90_p=0.5):
     """
     Returns an Albumentations Compose transform for training that applies:
-      - Resize to img_size x img_size
-      - Horizontal flip and random 90° rotations (probabilities configurable)
+      - Horizontal flip and random 90 deg rotations (probabilities configurable)
       - Color jitter
       - Normalization using ImageNet mean and std
       - Conversion to a PyTorch tensor
     """
     keypoint_params = A.KeypointParams(format="xy", remove_invisible=False) if use_keypoints else None
     return A.Compose([
-        A.Resize(img_size, img_size),
         A.HorizontalFlip(p=flip_p),
         A.RandomRotate90(p=rotate90_p),
         A.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.2),
@@ -41,13 +39,11 @@ def get_train_transform(img_size=224, use_keypoints=False, flip_p=0.5, rotate90_
 def get_val_transform(img_size=224, use_keypoints=False):
     """
     Returns an Albumentations Compose transform for validation/testing that applies:
-      - Resize to img_size x img_size
       - Normalization using ImageNet mean and std
       - Conversion to a PyTorch tensor
     """
     keypoint_params = A.KeypointParams(format="xy", remove_invisible=False) if use_keypoints else None
     return A.Compose([
-        A.Resize(img_size, img_size),
         A.Normalize(mean=(0.485, 0.456, 0.406),
                     std=(0.229, 0.224, 0.225)),
         ToTensorV2()
@@ -76,10 +72,11 @@ def plot_regression_metrics(epochs, mae_scores, r2_scores, save_path):
     ax1.set_xlabel("Epoch")
     ax1.set_ylabel("MAE (microns)")
     ax1.legend()
-    ax2.plot(epochs, r2_scores, label="R²", color="lime", lw=2)
-    ax2.set_title("R² Over Epochs")
+    ax2.plot(epochs, r2_scores, label="R^2", color="lime", lw=2)
+    ax2.set_title("R^2 Over Epochs")
     ax2.set_xlabel("Epoch")
-    ax2.set_ylabel("R²")
+    ax2.set_ylabel("R^2")
     ax2.legend()
     fig.savefig(save_path)
     plt.close(fig)
+

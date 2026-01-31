@@ -28,10 +28,11 @@ class PipetteDataset(Dataset):
     transformed consistently with the image.
     """
 
-    def __init__(self, image_dir, annotations_df, transform=None):
+    def __init__(self, image_dir, annotations_df, transform=None, img_size=224):
         self.image_dir = image_dir
         self.annotations_df = annotations_df.reset_index(drop=True)
         self.transform = transform
+        self.img_size = int(img_size)
 
     def __len__(self):
         return len(self.annotations_df)
@@ -40,18 +41,26 @@ class PipetteDataset(Dataset):
         row = self.annotations_df.iloc[idx]
         filename = row["filename"]
         image_path = os.path.join(self.image_dir, filename)
+
         img = Image.open(image_path).convert("RGB")
+        w0, h0 = img.size  # raw full-frame size (no hardcoding)
+        img = img.resize((self.img_size, self.img_size), resample=Image.BILINEAR)
         img_np = np.array(img)
 
-        # Targets in real units (pixels and microns)
         target_vals = row[["pipette_x_px", "pipette_y_px", "defocus_microns"]].astype(np.float32).to_numpy()
+
+        # Scale raw full-frame x/y into resized img_size frame
+        sx = self.img_size / float(w0)
+        sy = self.img_size / float(h0)
+        target_vals[0] = target_vals[0] * sx
+        target_vals[1] = target_vals[1] * sy
 
         if self.transform:
             keypoints = [(float(target_vals[0]), float(target_vals[1]))]
             augmented = self.transform(image=img_np, keypoints=keypoints)
             aug_x, aug_y = augmented["keypoints"][0]
-            target_vals[0] = aug_x
-            target_vals[1] = aug_y
+            target_vals[0] = float(aug_x)
+            target_vals[1] = float(aug_y)
             img_tensor = augmented["image"]
         else:
             img_tensor = torch.from_numpy(img_np).permute(2, 0, 1).float() / 255.0
@@ -143,17 +152,33 @@ class PipetteDataModule:
 
     def setup(self):
         self.load_annotations()
-        total_len = len(self.annotations_df)
-        indices = list(range(total_len))
+        coords = list(zip(
+            self.annotations_df["pipette_x_px"].astype(float).to_list(),
+            self.annotations_df["pipette_y_px"].astype(float).to_list(),
+        ))
+        coord_to_indices = {}
+        for i, key in enumerate(coords):
+            coord_to_indices.setdefault(key, []).append(i)
+
+        unique_keys = list(coord_to_indices.keys())
         random.seed(self.seed)
-        random.shuffle(indices)
+        random.shuffle(unique_keys)
 
-        train_end = int(total_len * self.train_split)
-        val_end = train_end + int(total_len * self.val_split)
+        total_len = len(self.annotations_df)
+        train_target = int(total_len * self.train_split)
+        val_target   = int(total_len * self.val_split)
 
-        train_indices = indices[:train_end]
-        val_indices   = indices[train_end:val_end]
-        test_indices  = indices[val_end:]
+        train_indices, val_indices, test_indices = [], [], []
+        count_train = count_val = 0
+
+        for key in unique_keys:
+            inds = coord_to_indices[key]
+            if count_train < train_target:
+                train_indices.extend(inds); count_train += len(inds)
+            elif count_val < val_target:
+                val_indices.extend(inds); count_val += len(inds)
+            else:
+                test_indices.extend(inds)
 
         # Sub-DataFrames for each split
         train_df = self.annotations_df.iloc[train_indices].reset_index(drop=True)
@@ -181,16 +206,19 @@ class PipetteDataModule:
             self.image_dir,
             train_df,
             transform=self.train_transform,
+            img_size=self.img_size,
         )
         self.val_dataset = PipetteDataset(
             self.image_dir,
             val_df,
             transform=self.val_transform,
+            img_size=self.img_size,
         )
         self.test_dataset = PipetteDataset(
             self.image_dir,
             test_df,
             transform=self.test_transform,
+            img_size=self.img_size,
         )
 
         # Save the split indices for reproducibility

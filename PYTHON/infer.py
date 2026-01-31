@@ -63,6 +63,8 @@ class Inferencer:
     def get_pipette_focus_value(self, img):
         """Return only the defocus prediction (microns)."""
         preds = self.predict(img)
+        if preds.size >= 3:
+            return float(preds[2])
         return float(preds[0])
 
     def get_pipette_pose(self, img):

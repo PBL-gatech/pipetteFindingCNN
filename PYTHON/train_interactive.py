@@ -107,6 +107,10 @@ class TrainingWorker(QThread):
             self.log_signal.emit(
                 f"Epoch {payload['epoch']}: "
                 f"Train Loss={payload['train_loss']:.4f}, Val Loss={payload['val_loss']:.4f}, "
+                f"HMLoss train/val=({payload['train_loss_heatmap']:.4f}/{payload['val_loss_heatmap']:.4f}), "
+                f"XYLoss train/val=({payload['train_loss_xy']:.4f}/{payload['val_loss_xy']:.4f}), "
+                f"ZLoss train/val=({payload['train_loss_z']:.4f}/{payload['val_loss_z']:.4f}), "
+                f"Val HM max/mean/std=({payload['val_hm_max']:.3f}/{payload['val_hm_mean']:.3f}/{payload['val_hm_std']:.3f}), "
                 f"MAE x/y/z = ({payload['MAE_x_px']:.2f}, {payload['MAE_y_px']:.2f}, {payload['MAE_z_um']:.3f}), "
                 f"R2 x/y/z = ({payload['R2_x']:.3f}, {payload['R2_y']:.3f}, {payload['R2_z']:.3f}), "
                 f"LR={payload['learning_rate']:.2e}"

@@ -78,13 +78,24 @@ def train_and_validate(
 
     best_val_loss = float("inf")
     best_checkpoint = None
-    global_step = 0
 
     history = {
         "epoch": [],
         "lr": [],
         "train_loss": [],
         "val_loss": [],
+        "train_loss_heatmap": [],
+        "val_loss_heatmap": [],
+        "train_loss_xy": [],
+        "val_loss_xy": [],
+        "train_loss_z": [],
+        "val_loss_z": [],
+        "train_hm_max": [],
+        "val_hm_max": [],
+        "train_hm_mean": [],
+        "val_hm_mean": [],
+        "train_hm_std": [],
+        "val_hm_std": [],
         "train_MAE_x_px": [],
         "train_MAE_y_px": [],
         "train_MAE_z_um": [],
@@ -102,6 +113,12 @@ def train_and_validate(
     for epoch in range(num_epochs):
         model.train()
         train_loss_sum = 0.0
+        train_loss_heatmap_sum = 0.0
+        train_loss_xy_sum = 0.0
+        train_loss_z_sum = 0.0
+        train_hm_max_list = []
+        train_hm_mean_list = []
+        train_hm_std_list = []
         preds_x, preds_y, preds_z, gts_x, gts_y, gts_z = [], [], [], [], [], []
 
         for images, targets in train_loader:
@@ -123,6 +140,12 @@ def train_and_validate(
                 optimizer.step()
 
             train_loss_sum += loss.item() * images.size(0)
+            train_loss_heatmap_sum += output["loss_heatmap"].item() * images.size(0)
+            train_loss_xy_sum += output["loss_xy"].item() * images.size(0)
+            train_loss_z_sum += output["loss_z"].item() * images.size(0)
+            train_hm_max_list.append(output["heatmap"].max().item())
+            train_hm_mean_list.append(output["heatmap"].mean().item())
+            train_hm_std_list.append(output["heatmap"].std().item())
             preds_x.append(output["x_px"].detach().cpu())
             preds_y.append(output["y_px"].detach().cpu())
             preds_z.append(output["defocus_microns"].detach().cpu())
@@ -130,17 +153,25 @@ def train_and_validate(
             gts_y.append(target_dict["xy"][:, 1].detach().cpu())
             gts_z.append(target_dict["z"].detach().cpu())
 
-            global_step += 1
-            if scheduler is not None and hasattr(scheduler, "step_update"):
-                scheduler.step_update(global_step)
-
         train_loss = train_loss_sum / len(train_loader.dataset)
+        train_loss_heatmap = train_loss_heatmap_sum / len(train_loader.dataset)
+        train_loss_xy = train_loss_xy_sum / len(train_loader.dataset)
+        train_loss_z = train_loss_z_sum / len(train_loader.dataset)
+        train_hm_max = sum(train_hm_max_list) / max(len(train_hm_max_list), 1)
+        train_hm_mean = sum(train_hm_mean_list) / max(len(train_hm_mean_list), 1)
+        train_hm_std = sum(train_hm_std_list) / max(len(train_hm_std_list), 1)
         train_metrics = _compute_metrics(
             _stack(preds_x), _stack(preds_y), _stack(preds_z), _stack(gts_x), _stack(gts_y), _stack(gts_z)
         )
 
         model.eval()
         val_loss_sum = 0.0
+        val_loss_heatmap_sum = 0.0
+        val_loss_xy_sum = 0.0
+        val_loss_z_sum = 0.0
+        val_hm_max_list = []
+        val_hm_mean_list = []
+        val_hm_std_list = []
         v_preds_x, v_preds_y, v_preds_z, v_gts_x, v_gts_y, v_gts_z = [], [], [], [], [], []
         with torch.no_grad():
             for images, targets in val_loader:
@@ -151,6 +182,12 @@ def train_and_validate(
                     output = model(images, targets=target_dict, compute_loss=True)
                     loss = output["loss"]
                 val_loss_sum += loss.item() * images.size(0)
+                val_loss_heatmap_sum += output["loss_heatmap"].item() * images.size(0)
+                val_loss_xy_sum += output["loss_xy"].item() * images.size(0)
+                val_loss_z_sum += output["loss_z"].item() * images.size(0)
+                val_hm_max_list.append(output["heatmap"].max().item())
+                val_hm_mean_list.append(output["heatmap"].mean().item())
+                val_hm_std_list.append(output["heatmap"].std().item())
                 v_preds_x.append(output["x_px"].detach().cpu())
                 v_preds_y.append(output["y_px"].detach().cpu())
                 v_preds_z.append(output["defocus_microns"].detach().cpu())
@@ -159,6 +196,12 @@ def train_and_validate(
                 v_gts_z.append(target_dict["z"].detach().cpu())
 
         val_loss = val_loss_sum / len(val_loader.dataset)
+        val_loss_heatmap = val_loss_heatmap_sum / len(val_loader.dataset)
+        val_loss_xy = val_loss_xy_sum / len(val_loader.dataset)
+        val_loss_z = val_loss_z_sum / len(val_loader.dataset)
+        val_hm_max = sum(val_hm_max_list) / max(len(val_hm_max_list), 1)
+        val_hm_mean = sum(val_hm_mean_list) / max(len(val_hm_mean_list), 1)
+        val_hm_std = sum(val_hm_std_list) / max(len(val_hm_std_list), 1)
         val_metrics = _compute_metrics(
             _stack(v_preds_x), _stack(v_preds_y), _stack(v_preds_z),
             _stack(v_gts_x), _stack(v_gts_y), _stack(v_gts_z)
@@ -170,6 +213,18 @@ def train_and_validate(
         history["lr"].append(current_lr)
         history["train_loss"].append(train_loss)
         history["val_loss"].append(val_loss)
+        history["train_loss_heatmap"].append(train_loss_heatmap)
+        history["val_loss_heatmap"].append(val_loss_heatmap)
+        history["train_loss_xy"].append(train_loss_xy)
+        history["val_loss_xy"].append(val_loss_xy)
+        history["train_loss_z"].append(train_loss_z)
+        history["val_loss_z"].append(val_loss_z)
+        history["train_hm_max"].append(train_hm_max)
+        history["val_hm_max"].append(val_hm_max)
+        history["train_hm_mean"].append(train_hm_mean)
+        history["val_hm_mean"].append(val_hm_mean)
+        history["train_hm_std"].append(train_hm_std)
+        history["val_hm_std"].append(val_hm_std)
         history["train_MAE_x_px"].append(train_metrics["MAE_x_px"])
         history["train_MAE_y_px"].append(train_metrics["MAE_y_px"])
         history["train_MAE_z_um"].append(train_metrics["MAE_z_um"])
@@ -188,8 +243,10 @@ def train_and_validate(
         print(
             f"Epoch {epoch + 1}/{num_epochs} | "
             f"Train Loss {train_loss:.4f} | Val Loss {val_loss:.4f} | "
+            f"Val HMLoss {val_loss_heatmap:.4f} XYLoss {val_loss_xy:.4f} ZLoss {val_loss_z:.4f} | "
+            f"Val HM max/mean/std = {val_hm_max:.3f}/{val_hm_mean:.3f}/{val_hm_std:.3f} | "
             f"MAE(px) x {val_metrics['MAE_x_px']:.2f} y {val_metrics['MAE_y_px']:.2f} | "
-            f"MAE_z {val_metrics['MAE_z_um']:.3f} µm | "
+            f"MAE_z {val_metrics['MAE_z_um']:.3f} um | "
             f"R2 x {val_metrics['R2_x']:.3f} y {val_metrics['R2_y']:.3f} z {val_metrics['R2_z']:.3f} | "
             f"LR {current_lr:.2e}"
         )
@@ -199,6 +256,15 @@ def train_and_validate(
                 "epoch": epoch + 1,
                 "train_loss": train_loss,
                 "val_loss": val_loss,
+                "train_loss_heatmap": train_loss_heatmap,
+                "val_loss_heatmap": val_loss_heatmap,
+                "train_loss_xy": train_loss_xy,
+                "val_loss_xy": val_loss_xy,
+                "train_loss_z": train_loss_z,
+                "val_loss_z": val_loss_z,
+                "val_hm_max": val_hm_max,
+                "val_hm_mean": val_hm_mean,
+                "val_hm_std": val_hm_std,
                 "learning_rate": current_lr,
                 "MAE_x_px": val_metrics["MAE_x_px"],
                 "MAE_y_px": val_metrics["MAE_y_px"],
@@ -213,6 +279,9 @@ def train_and_validate(
             best_val_loss = val_loss
             best_checkpoint = os.path.join(run_folder, f"best_model_epoch{epoch + 1}.pth")
             torch.save(model.state_dict(), best_checkpoint)
+
+        if scheduler is not None:
+            scheduler.step(epoch + 1)
 
     return best_checkpoint, history
 
@@ -311,3 +380,4 @@ if __name__ == "__main__":
 
     model.load_state_dict(torch.load(best_checkpoint, map_location=device))
     test_model(model, test_loader, device, run_folder=run_folder)
+
