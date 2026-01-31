@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
 import os
+import json
 import datetime
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
+from tqdm.auto import tqdm
 from model import get_regression_model  # Creates model with a regression head
 from data import PipetteDataModule  # Your data module with 70/20/10 split
 from utils import plot_training_metrics, plot_regression_metrics, get_train_transform, get_val_transform
 import timm
-from timm.optim import create_optimizer_v2, optimizer_kwargs
-from timm.scheduler import create_scheduler_v2, scheduler_kwargs
+from timm.optim import create_optimizer_v2
+from timm.scheduler import create_scheduler_v2
 
 # --- Run folder creation ---
 def create_run_folder(model_name, config=None):
@@ -28,14 +30,23 @@ def create_run_folder(model_name, config=None):
 
 
 # --- Training and Validation Loop with timm optimizations ---
-def train_and_validate(model, train_loader, val_loader, device, run_folder, num_epochs=50, update=False, update_callback=None):
+def train_and_validate(model, train_loader, val_loader, device, run_folder,
+                       num_epochs=50, update=False, update_callback=None,
+                       huber_beta: float = 1.0, learning_rate: float = 1e-4):
     # Create the optimizer directly
-    optimizer = create_optimizer_v2(model, "adamw", lr=1e-4, weight_decay=2e-5)
+    optimizer = create_optimizer_v2(model, "adamw", lr=learning_rate, weight_decay=2e-5)
     
-    # Create the scheduler directly (returns a tuple, we only need the scheduler)
-    scheduler, _ = create_scheduler_v2(optimizer, "cosine", num_epochs=num_epochs, updates_per_epoch=len(train_loader))
+    # Create the scheduler with a short warmup to stabilize training
+    scheduler, _ = create_scheduler_v2(
+        optimizer,
+        "cosine",
+        num_epochs=num_epochs,
+        updates_per_epoch=len(train_loader),
+        warmup_epochs=5,
+    )
     
-    criterion = nn.MSELoss()  # Regression loss
+    # Huber (SmoothL1) is often better-behaved for defocus regression
+    criterion = nn.SmoothL1Loss(beta=huber_beta)
     scaler = torch.amp.GradScaler() if device.type == "cuda" else None
 
     best_val_loss = float('inf')
@@ -45,10 +56,11 @@ def train_and_validate(model, train_loader, val_loader, device, run_folder, num_
     mae_scores, r2_scores = [], []
     epochs_list = []
 
+    num_updates = 0
     for epoch in range(num_epochs):
         model.train()
         running_loss = 0.0
-        for images, targets in train_loader:
+        for images, targets in tqdm(train_loader, desc=f"Train {epoch+1}/{num_epochs}", leave=False):
             images = images.to(device)
             targets = targets.to(device)
             optimizer.zero_grad()
@@ -62,6 +74,8 @@ def train_and_validate(model, train_loader, val_loader, device, run_folder, num_
             else:
                 loss.backward()
                 optimizer.step()
+            num_updates += 1
+            scheduler.step_update(num_updates=num_updates)
             running_loss += loss.item() * images.size(0)
         train_loss = running_loss / len(train_loader.dataset)
         train_losses.append(train_loss)
@@ -71,7 +85,7 @@ def train_and_validate(model, train_loader, val_loader, device, run_folder, num_
         val_running_loss = 0.0
         all_preds, all_targets = [], []
         with torch.no_grad():
-            for images, targets in val_loader:
+            for images, targets in tqdm(val_loader, desc=f"Val   {epoch+1}/{num_epochs}", leave=False):
                 images = images.to(device)
                 targets = targets.to(device)
                 with torch.amp.autocast(enabled=(scaler is not None),device_type='cuda'):
@@ -85,16 +99,23 @@ def train_and_validate(model, train_loader, val_loader, device, run_folder, num_
 
         preds = torch.cat(all_preds)
         targets_cat = torch.cat(all_targets)
-        mae = torch.mean(torch.abs(preds - targets_cat)).item()
-        ss_res = torch.sum((targets_cat - preds)**2)
-        ss_tot = torch.sum((targets_cat - torch.mean(targets_cat))**2) + 1e-8
+
+        # Denormalize to microns for reporting
+        z_mean = getattr(train_loader.dataset, "z_mean", 0.0)
+        z_std = getattr(train_loader.dataset, "z_std", 1.0)
+        preds_real = preds * z_std + z_mean
+        targets_real = targets_cat * z_std + z_mean
+
+        mae = torch.mean(torch.abs(preds_real - targets_real)).item()
+        ss_res = torch.sum((targets_real - preds_real) ** 2)
+        ss_tot = torch.sum((targets_real - torch.mean(targets_real)) ** 2) + 1e-8
         r2 = 1 - ss_res / ss_tot
 
         mae_scores.append(mae)
         r2_scores.append(r2.item())
         epochs_list.append(epoch+1)
 
-        print(f"Epoch {epoch+1}/{num_epochs}: Train Loss: {train_loss:.4f}  Val Loss: {val_loss:.4f}  MAE: {mae:.4f}  R²: {r2:.4f}")
+        print(f"Epoch {epoch+1}/{num_epochs}: Train Loss: {train_loss:.4f}  Val Loss: {val_loss:.4f}  MAE: {mae:.4f}  R^2: {r2:.4f}")
         
         scheduler.step(epoch + 1)
 
@@ -129,11 +150,18 @@ def test_model(model, test_loader, device, criterion, run_folder):
     test_loss /= len(test_loader.dataset)
     preds = torch.cat(all_preds)
     targets_cat = torch.cat(all_targets)
-    mae = torch.mean(torch.abs(preds - targets_cat)).item()
-    ss_res = torch.sum((targets_cat - preds)**2)
-    ss_tot = torch.sum((targets_cat - torch.mean(targets_cat))**2) + 1e-8
+
+    # Denormalize to microns for reporting
+    z_mean = getattr(test_loader.dataset, "z_mean", 0.0)
+    z_std = getattr(test_loader.dataset, "z_std", 1.0)
+    preds_real = preds * z_std + z_mean
+    targets_real = targets_cat * z_std + z_mean
+
+    mae = torch.mean(torch.abs(preds_real - targets_real)).item()
+    ss_res = torch.sum((targets_real - preds_real) ** 2)
+    ss_tot = torch.sum((targets_real - torch.mean(targets_real)) ** 2) + 1e-8
     r2 = 1 - ss_res/ss_tot
-    results = {"Test Loss": test_loss, "Test MAE": mae, "Test R²": r2.item()}
+    results = {"Test Loss": test_loss, "Test MAE": mae, "Test R2": r2.item()}
     with open(os.path.join(run_folder, "test_results.txt"), "w") as f:
         for k, v in results.items():
             f.write(f"{k}: {v:.4f}\n")
@@ -144,31 +172,36 @@ def test_model(model, test_loader, device, criterion, run_folder):
 if __name__ == '__main__':
     image_dir = "path/to/images"
     annotation_file = "path/to/annotations.csv"
-    
-    data_module = PipetteDataModule(
-        image_dir, 
-        annotation_file,
-        train_split=0.7, 
-        val_split=0.2, 
-        test_split=0.1, 
-        seed=42,
-        train_transform=get_train_transform(img_size=224),
-        val_transform=get_val_transform(img_size=224),
-        test_transform=get_val_transform(img_size=224)
-    )
-    train_dataset, val_dataset, test_dataset = data_module.setup()
-    
     model_name = "mobilenetv3_large_100"
+    learning_rate = 1e-4
+    num_epochs = 50
     config = {
         "model_name": model_name,
         "batch_size": 32,
-        "learning_rate": 1e-4,
-        "num_epochs": 50,
-        "threshold": 0.3,
-        "device": "cuda" if torch.cuda.is_available() else "cpu"
+        "learning_rate": learning_rate,
+        "num_epochs": num_epochs,
+        "device": "cuda" if torch.cuda.is_available() else "cpu",
+        "img_size": 224,
     }
     run_folder = create_run_folder(model_name, config=config)
     print("Run folder created at:", run_folder)
+
+    data_module = PipetteDataModule(
+        image_dir,
+        annotation_file,
+        train_split=0.7,
+        val_split=0.2,
+        test_split=0.1,
+        seed=42,
+        default_img_size=224,
+        split_save_path=os.path.join(run_folder, "data_splits.pkl"),
+    )
+    train_dataset, val_dataset, test_dataset = data_module.setup()
+
+    # Persist channel normalization stats for inference
+    if data_module.channel_mean is not None and data_module.channel_std is not None:
+        with open(os.path.join(run_folder, "channel_norm.json"), "w") as f:
+            json.dump({"mean": data_module.channel_mean, "std": data_module.channel_std}, f, indent=2)
     
     model = get_regression_model(model_name=model_name, pretrained=True, output_dim=1)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -180,7 +213,7 @@ if __name__ == '__main__':
     test_loader  = DataLoader(test_dataset, batch_size=32, shuffle=False, num_workers=4)
     
     best_checkpoint, epochs_list, train_losses, val_losses, mae_scores, r2_scores = train_and_validate(
-        model, train_loader, val_loader, device, run_folder, num_epochs=50
+        model, train_loader, val_loader, device, run_folder, num_epochs=num_epochs, learning_rate=learning_rate
     )
     
     model.load_state_dict(torch.load(best_checkpoint))
