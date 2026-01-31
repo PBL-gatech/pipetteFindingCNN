@@ -18,37 +18,40 @@ from albumentations.pytorch import ToTensorV2
 # Albumentations Transforms
 # ----------------------------
 
-def get_train_transform(img_size=224):
+def get_train_transform(img_size=224, use_keypoints=False, flip_p=0.5, rotate90_p=0.5):
     """
     Returns an Albumentations Compose transform for training that applies:
       - Resize to img_size x img_size
-      - Horizontal flip, random 90° rotations, and color jitter
+      - Horizontal flip and random 90° rotations (probabilities configurable)
+      - Color jitter
       - Normalization using ImageNet mean and std
       - Conversion to a PyTorch tensor
     """
+    keypoint_params = A.KeypointParams(format="xy", remove_invisible=False) if use_keypoints else None
     return A.Compose([
         A.Resize(img_size, img_size),
-        A.HorizontalFlip(p=0.5),
-        A.RandomRotate90(p=0.5),
+        A.HorizontalFlip(p=flip_p),
+        A.RandomRotate90(p=rotate90_p),
         A.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.2),
         A.Normalize(mean=(0.485, 0.456, 0.406),
                     std=(0.229, 0.224, 0.225)),
         ToTensorV2()
-    ])
+    ], keypoint_params=keypoint_params)
 
-def get_val_transform(img_size=224):
+def get_val_transform(img_size=224, use_keypoints=False):
     """
     Returns an Albumentations Compose transform for validation/testing that applies:
       - Resize to img_size x img_size
       - Normalization using ImageNet mean and std
       - Conversion to a PyTorch tensor
     """
+    keypoint_params = A.KeypointParams(format="xy", remove_invisible=False) if use_keypoints else None
     return A.Compose([
         A.Resize(img_size, img_size),
         A.Normalize(mean=(0.485, 0.456, 0.406),
                     std=(0.229, 0.224, 0.225)),
         ToTensorV2()
-    ])
+    ], keypoint_params=keypoint_params)
 
 # ----------------------------
 # Plotting Utilities

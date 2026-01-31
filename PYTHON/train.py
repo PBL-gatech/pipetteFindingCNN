@@ -1,202 +1,313 @@
 #!/usr/bin/env python3
 import os
+import json
 import datetime
-import torch
-import torch.nn as nn
-from torch.utils.data import DataLoader
-from model import get_regression_model  # Creates model with a regression head
-from data import PipetteDataModule  # Your data module with 70/20/10 split
-from utils import plot_training_metrics, plot_regression_metrics, get_train_transform, get_val_transform
-import timm
-from timm.optim import create_optimizer_v2, optimizer_kwargs
-from timm.scheduler import create_scheduler_v2, scheduler_kwargs
+from contextlib import nullcontext
 
-# --- Run folder creation ---
+import torch
+from torch.utils.data import DataLoader
+from timm.optim import create_optimizer_v2
+from timm.scheduler import create_scheduler_v2
+
+from model import build_model
+from data import PipetteDataModule
+
+
 def create_run_folder(model_name, config=None):
     training_dir = os.path.join(os.getcwd(), "training")
     os.makedirs(training_dir, exist_ok=True)
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     run_folder = os.path.join(training_dir, f"train-{model_name}-{timestamp}")
     os.makedirs(run_folder, exist_ok=True)
-    # Save the configuration if provided
     if config is not None:
-        config_path = os.path.join(run_folder, "config.txt")
-        with open(config_path, "w") as f:
-            for key, value in config.items():
-                f.write(f"{key}: {value}\n")
+        with open(os.path.join(run_folder, "config.json"), "w") as f:
+            json.dump(config, f, indent=2)
     return run_folder
 
 
-# --- Training and Validation Loop with timm optimizations ---
-def train_and_validate(model, train_loader, val_loader, device, run_folder, num_epochs=50, update=False, update_callback=None):
-    # Create the optimizer directly
-    optimizer = create_optimizer_v2(model, "adamw", lr=1e-4, weight_decay=2e-5)
-    
-    # Create the scheduler directly (returns a tuple, we only need the scheduler)
-    scheduler, _ = create_scheduler_v2(optimizer, "cosine", num_epochs=num_epochs, updates_per_epoch=len(train_loader))
-    
-    criterion = nn.MSELoss()  # Regression loss
-    scaler = torch.amp.GradScaler() if device.type == "cuda" else None
+def _stack(tensors):
+    return torch.cat(tensors) if len(tensors) > 0 else torch.tensor([])
 
-    best_val_loss = float('inf')
+
+def _compute_metrics(pred_x, pred_y, pred_z, gt_x, gt_y, gt_z):
+    mae_x = torch.mean(torch.abs(pred_x - gt_x)).item()
+    mae_y = torch.mean(torch.abs(pred_y - gt_y)).item()
+    mae_z = torch.mean(torch.abs(pred_z - gt_z)).item()
+
+    def _r2(pred, target):
+        ss_res = torch.sum((target - pred) ** 2)
+        ss_tot = torch.sum((target - target.mean()) ** 2) + 1e-8
+        return (1 - ss_res / ss_tot).item()
+
+    return {
+        "MAE_x_px": mae_x,
+        "MAE_y_px": mae_y,
+        "MAE_z_um": mae_z,
+        "R2_x": _r2(pred_x, gt_x),
+        "R2_y": _r2(pred_y, gt_y),
+        "R2_z": _r2(pred_z, gt_z),
+    }
+
+
+def _write_history(run_folder, history):
+    path = os.path.join(run_folder, "metrics_history.json")
+    with open(path, "w") as f:
+        json.dump(history, f, indent=2)
+
+
+def train_and_validate(
+    model,
+    train_loader,
+    val_loader,
+    device,
+    run_folder,
+    num_epochs=50,
+    learning_rate=1e-4,
+    weight_decay=2e-5,
+    mixed_precision=True,
+    update_callback=None,
+):
+    optimizer = create_optimizer_v2(model, "adamw", lr=learning_rate, weight_decay=weight_decay)
+    scheduler, _ = create_scheduler_v2(
+        optimizer, "cosine", num_epochs=num_epochs, updates_per_epoch=len(train_loader)
+    )
+
+    use_amp = mixed_precision and device.type == "cuda"
+    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+    autocast_ctx = torch.cuda.amp.autocast if use_amp else nullcontext
+
+    best_val_loss = float("inf")
     best_checkpoint = None
-    
-    train_losses, val_losses = [], []
-    mae_scores, r2_scores = [], []
-    epochs_list = []
+    global_step = 0
+
+    history = {
+        "epoch": [],
+        "lr": [],
+        "train_loss": [],
+        "val_loss": [],
+        "train_MAE_x_px": [],
+        "train_MAE_y_px": [],
+        "train_MAE_z_um": [],
+        "val_MAE_x_px": [],
+        "val_MAE_y_px": [],
+        "val_MAE_z_um": [],
+        "train_R2_x": [],
+        "train_R2_y": [],
+        "train_R2_z": [],
+        "val_R2_x": [],
+        "val_R2_y": [],
+        "val_R2_z": [],
+    }
 
     for epoch in range(num_epochs):
         model.train()
-        running_loss = 0.0
+        train_loss_sum = 0.0
+        preds_x, preds_y, preds_z, gts_x, gts_y, gts_z = [], [], [], [], [], []
+
         for images, targets in train_loader:
             images = images.to(device)
             targets = targets.to(device)
-            optimizer.zero_grad()
-            with torch.amp.autocast(enabled=(scaler is not None),device_type='cuda'):
-                outputs = model(images)
-                if targets.ndim == 1:
-                    targets = targets.unsqueeze(1)
-                loss = criterion(outputs, targets)
-            if scaler:
+            target_dict = {"xy": targets[:, :2], "z": targets[:, 2]}
+
+            optimizer.zero_grad(set_to_none=True)
+            with autocast_ctx():
+                output = model(images, targets=target_dict, compute_loss=True)
+                loss = output["loss"]
+
+            if use_amp:
                 scaler.scale(loss).backward()
                 scaler.step(optimizer)
                 scaler.update()
             else:
                 loss.backward()
                 optimizer.step()
-            running_loss += loss.item() * images.size(0)
-        train_loss = running_loss / len(train_loader.dataset)
-        train_losses.append(train_loss)
 
-        # Validation phase
+            train_loss_sum += loss.item() * images.size(0)
+            preds_x.append(output["x_px"].detach().cpu())
+            preds_y.append(output["y_px"].detach().cpu())
+            preds_z.append(output["defocus_microns"].detach().cpu())
+            gts_x.append(target_dict["xy"][:, 0].detach().cpu())
+            gts_y.append(target_dict["xy"][:, 1].detach().cpu())
+            gts_z.append(target_dict["z"].detach().cpu())
+
+            global_step += 1
+            if scheduler is not None and hasattr(scheduler, "step_update"):
+                scheduler.step_update(global_step)
+
+        train_loss = train_loss_sum / len(train_loader.dataset)
+        train_metrics = _compute_metrics(
+            _stack(preds_x), _stack(preds_y), _stack(preds_z), _stack(gts_x), _stack(gts_y), _stack(gts_z)
+        )
+
         model.eval()
-        val_running_loss = 0.0
-        all_preds, all_targets = [], []
+        val_loss_sum = 0.0
+        v_preds_x, v_preds_y, v_preds_z, v_gts_x, v_gts_y, v_gts_z = [], [], [], [], [], []
         with torch.no_grad():
             for images, targets in val_loader:
                 images = images.to(device)
                 targets = targets.to(device)
-                with torch.amp.autocast(enabled=(scaler is not None),device_type='cuda'):
-                    outputs = model(images)
-                    if targets.ndim == 1:
-                        targets = targets.unsqueeze(1)
-                    loss = criterion(outputs, targets)
-                val_running_loss += loss.item() * images.size(0)
-                all_preds.append(outputs.cpu())
-                all_targets.append(targets.cpu())
-        val_loss = val_running_loss / len(val_loader.dataset)
-        val_losses.append(val_loss)
+                target_dict = {"xy": targets[:, :2], "z": targets[:, 2]}
+                with autocast_ctx():
+                    output = model(images, targets=target_dict, compute_loss=True)
+                    loss = output["loss"]
+                val_loss_sum += loss.item() * images.size(0)
+                v_preds_x.append(output["x_px"].detach().cpu())
+                v_preds_y.append(output["y_px"].detach().cpu())
+                v_preds_z.append(output["defocus_microns"].detach().cpu())
+                v_gts_x.append(target_dict["xy"][:, 0].detach().cpu())
+                v_gts_y.append(target_dict["xy"][:, 1].detach().cpu())
+                v_gts_z.append(target_dict["z"].detach().cpu())
 
-        preds = torch.cat(all_preds)
-        targets_cat = torch.cat(all_targets)
-        preds_flat = preds.view(preds.size(0), -1)
-        targets_flat = targets_cat.view(targets_cat.size(0), -1)
-        mae = torch.mean(torch.abs(preds_flat - targets_flat)).item()
-        ss_res = torch.sum((targets_flat - preds_flat)**2)
-        mean_targets = torch.mean(targets_flat, dim=0)
-        ss_tot = torch.sum((targets_flat - mean_targets)**2) + 1e-8
-        r2 = 1 - ss_res / ss_tot
+        val_loss = val_loss_sum / len(val_loader.dataset)
+        val_metrics = _compute_metrics(
+            _stack(v_preds_x), _stack(v_preds_y), _stack(v_preds_z),
+            _stack(v_gts_x), _stack(v_gts_y), _stack(v_gts_z)
+        )
 
-        mae_scores.append(mae)
-        r2_scores.append(r2.item())
-        epochs_list.append(epoch+1)
+        current_lr = optimizer.param_groups[0]["lr"]
 
-        print(f"Epoch {epoch+1}/{num_epochs}: Train Loss: {train_loss:.4f}  Val Loss: {val_loss:.4f}  MAE: {mae:.4f}  R²: {r2:.4f}")
-        
-        scheduler.step(epoch + 1)
+        history["epoch"].append(epoch + 1)
+        history["lr"].append(current_lr)
+        history["train_loss"].append(train_loss)
+        history["val_loss"].append(val_loss)
+        history["train_MAE_x_px"].append(train_metrics["MAE_x_px"])
+        history["train_MAE_y_px"].append(train_metrics["MAE_y_px"])
+        history["train_MAE_z_um"].append(train_metrics["MAE_z_um"])
+        history["val_MAE_x_px"].append(val_metrics["MAE_x_px"])
+        history["val_MAE_y_px"].append(val_metrics["MAE_y_px"])
+        history["val_MAE_z_um"].append(val_metrics["MAE_z_um"])
+        history["train_R2_x"].append(train_metrics["R2_x"])
+        history["train_R2_y"].append(train_metrics["R2_y"])
+        history["train_R2_z"].append(train_metrics["R2_z"])
+        history["val_R2_x"].append(val_metrics["R2_x"])
+        history["val_R2_y"].append(val_metrics["R2_y"])
+        history["val_R2_z"].append(val_metrics["R2_z"])
 
-        if update and (update_callback is not None):
-            update_callback(epoch+1, train_loss, val_loss, mae, r2.item())
+        _write_history(run_folder, history)
+
+        print(
+            f"Epoch {epoch + 1}/{num_epochs} | "
+            f"Train Loss {train_loss:.4f} | Val Loss {val_loss:.4f} | "
+            f"MAE(px) x {val_metrics['MAE_x_px']:.2f} y {val_metrics['MAE_y_px']:.2f} | "
+            f"MAE_z {val_metrics['MAE_z_um']:.3f} µm | "
+            f"R2 x {val_metrics['R2_x']:.3f} y {val_metrics['R2_y']:.3f} z {val_metrics['R2_z']:.3f} | "
+            f"LR {current_lr:.2e}"
+        )
+
+        if update_callback is not None:
+            update_payload = {
+                "epoch": epoch + 1,
+                "train_loss": train_loss,
+                "val_loss": val_loss,
+                "learning_rate": current_lr,
+                "MAE_x_px": val_metrics["MAE_x_px"],
+                "MAE_y_px": val_metrics["MAE_y_px"],
+                "MAE_z_um": val_metrics["MAE_z_um"],
+                "R2_x": val_metrics["R2_x"],
+                "R2_y": val_metrics["R2_y"],
+                "R2_z": val_metrics["R2_z"],
+            }
+            update_callback(update_payload)
 
         if val_loss < best_val_loss:
             best_val_loss = val_loss
-            best_checkpoint = os.path.join(run_folder, f"best_model_focus_epoch{epoch+1}.pth")
+            best_checkpoint = os.path.join(run_folder, f"best_model_epoch{epoch + 1}.pth")
             torch.save(model.state_dict(), best_checkpoint)
-            print(f"Best model updated and saved to {best_checkpoint}")
 
-        plot_training_metrics(epochs_list, train_losses, val_losses, os.path.join(run_folder, "loss.png"))
-        plot_regression_metrics(epochs_list, mae_scores, r2_scores, os.path.join(run_folder, "metrics.png"))
-    
-    return best_checkpoint, epochs_list, train_losses, val_losses, mae_scores, r2_scores
+    return best_checkpoint, history
 
-# --- Testing Function ---
-def test_model(model, test_loader, device, criterion, run_folder):
+
+def test_model(model, test_loader, device, run_folder=None):
     model.eval()
-    test_loss = 0.0
-    all_preds, all_targets = [], []
+    loss_sum = 0.0
+    preds_x, preds_y, preds_z, gts_x, gts_y, gts_z = [], [], [], [], [], []
     with torch.no_grad():
         for images, targets in test_loader:
             images = images.to(device)
             targets = targets.to(device)
-            outputs = model(images)
-            if targets.ndim == 1:
-                targets = targets.unsqueeze(1)
-            loss = criterion(outputs, targets)
-            test_loss += loss.item() * images.size(0)
-            all_preds.append(outputs.cpu())
-            all_targets.append(targets.cpu())
-    test_loss /= len(test_loader.dataset)
-    preds = torch.cat(all_preds)
-    targets_cat = torch.cat(all_targets)
-    preds_flat = preds.view(preds.size(0), -1)
-    targets_flat = targets_cat.view(targets_cat.size(0), -1)
-    mae = torch.mean(torch.abs(preds_flat - targets_flat)).item()
-    ss_res = torch.sum((targets_flat - preds_flat)**2)
-    mean_targets = torch.mean(targets_flat, dim=0)
-    ss_tot = torch.sum((targets_flat - mean_targets)**2) + 1e-8
-    r2 = 1 - ss_res/ss_tot
-    results = {"Test Loss": test_loss, "Test MAE": mae, "Test R²": r2.item()}
-    with open(os.path.join(run_folder, "test_results.txt"), "w") as f:
-        for k, v in results.items():
-            f.write(f"{k}: {v:.4f}\n")
-    print("Final test results saved to", os.path.join(run_folder, "test_results.txt"))
+            target_dict = {"xy": targets[:, :2], "z": targets[:, 2]}
+            output = model(images, targets=target_dict, compute_loss=True)
+            loss = output["loss"]
+            loss_sum += loss.item() * images.size(0)
+            preds_x.append(output["x_px"].detach().cpu())
+            preds_y.append(output["y_px"].detach().cpu())
+            preds_z.append(output["defocus_microns"].detach().cpu())
+            gts_x.append(target_dict["xy"][:, 0].detach().cpu())
+            gts_y.append(target_dict["xy"][:, 1].detach().cpu())
+            gts_z.append(target_dict["z"].detach().cpu())
+
+    test_loss = loss_sum / len(test_loader.dataset)
+    metrics = _compute_metrics(
+        _stack(preds_x), _stack(preds_y), _stack(preds_z),
+        _stack(gts_x), _stack(gts_y), _stack(gts_z)
+    )
+
+    results = {"Test Loss": test_loss, **metrics}
+    if run_folder:
+        path = os.path.join(run_folder, "test_results.json")
+        with open(path, "w") as f:
+            json.dump(results, f, indent=2)
+        print(f"Test results saved to {path}")
     return results
 
-# --- Main ---
-if __name__ == '__main__':
+
+if __name__ == "__main__":
     image_dir = "path/to/images"
     annotation_file = "path/to/annotations.csv"
-    
+
     data_module = PipetteDataModule(
-        image_dir, 
+        image_dir,
         annotation_file,
-        train_split=0.7, 
-        val_split=0.2, 
-        test_split=0.1, 
+        train_split=0.7,
+        val_split=0.2,
+        test_split=0.1,
         seed=42,
-        train_transform=get_train_transform(img_size=224),
-        val_transform=get_val_transform(img_size=224),
-        test_transform=get_val_transform(img_size=224)
+        img_size=224,
     )
     train_dataset, val_dataset, test_dataset = data_module.setup()
-    output_dim = data_module.target_dim
-    
-    model_name = "mobilenetv3_large_100"
-    config = {
-        "model_name": model_name,
-        "batch_size": 32,
-        "learning_rate": 1e-4,
-        "num_epochs": 50,
-        "threshold": 0.3,
-        "device": "cuda" if torch.cuda.is_available() else "cpu",
-        "output_dim": output_dim
-    }
-    run_folder = create_run_folder(model_name, config=config)
-    print("Run folder created at:", run_folder)
-    
-    model = get_regression_model(model_name=model_name, pretrained=True, output_dim=output_dim)
+
+    model = build_model(
+        model_name="mobilenetv3_large_100",
+        pretrained=True,
+        heatmap_sigma=2.0,
+        heatmap_stride=4,
+        lambda_z=1.0,
+        huber_beta=1.0,
+    )
+    model.set_z_stats(*data_module.get_z_stats())
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
-    
-    from torch.utils.data import DataLoader
+
     train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True, num_workers=4)
-    val_loader   = DataLoader(val_dataset, batch_size=32, shuffle=False, num_workers=4)
-    test_loader  = DataLoader(test_dataset, batch_size=32, shuffle=False, num_workers=4)
-    
-    best_checkpoint, epochs_list, train_losses, val_losses, mae_scores, r2_scores = train_and_validate(
-        model, train_loader, val_loader, device, run_folder, num_epochs=50
+    val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False, num_workers=4)
+    test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False, num_workers=4)
+
+    config = {
+        "model_name": "mobilenetv3_large_100",
+        "batch_size": 32,
+        "learning_rate": 1e-4,
+        "weight_decay": 2e-5,
+        "num_epochs": 50,
+        "heatmap_sigma": 2.0,
+        "heatmap_stride": 4,
+        "lambda_z": 1.0,
+        "huber_beta": 1.0,
+        "device": str(device),
+    }
+    run_folder = create_run_folder(config["model_name"], config=config)
+
+    best_checkpoint, history = train_and_validate(
+        model,
+        train_loader,
+        val_loader,
+        device,
+        run_folder,
+        num_epochs=config["num_epochs"],
+        learning_rate=config["learning_rate"],
+        weight_decay=config["weight_decay"],
+        mixed_precision=True,
     )
-    
-    model.load_state_dict(torch.load(best_checkpoint))
-    criterion = nn.MSELoss()
-    test_results = test_model(model, test_loader, device, criterion, run_folder)
+
+    model.load_state_dict(torch.load(best_checkpoint, map_location=device))
+    test_model(model, test_loader, device, run_folder=run_folder)
