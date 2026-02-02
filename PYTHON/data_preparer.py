@@ -119,6 +119,8 @@ def main():
     # base_dir = r"C:\Users\sa-forest\Documents\GitHub\pipetteFindingCNN\pipettedata\3DPrelimData\2026_01_30-17_59"
     # base_dir = r"C:\Users\sa-forest\Documents\GitHub\pipetteFindingCNN\pipettedata\3DPrelimData\2026_01_30-18_09"
     # base_dir =r"C:\Users\sa-forest\Documents\GitHub\pipetteFindingCNN\pipettedata\3DPrelimData\2026_01_30-19_28"
+    # base_dir = r"C:\Users\sa-forest\Documents\GitHub\pipetteFindingCNN\pipettedata\3DPrelimData\2026_02_02-13_28"
+    base_dir = r"C:\Users\sa-forest\Documents\GitHub\pipetteFindingCNN\pipettedata\3DPrelimData\2026_02_02-13_37"
     camera_frames_dir = os.path.join(base_dir, "camera_frames")
     movement_file_path = os.path.join(base_dir, "movement_recording.csv")
     

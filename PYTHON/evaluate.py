@@ -59,7 +59,7 @@ def evaluate_trained_model(
     trainer.run_folder = run_folder
 
     logging.info("Evaluating best model on the test set...")
-    test_loss, test_acc, test_mae, test_r2 = trainer.test_model(test_dataset,best_model="best_model_focus_22.pth")
+    test_loss, test_acc, test_mae, test_r2 = trainer.test_model(test_dataset,best_model="best_model_focus_epoch59.pth")
 
     logging.info("Done evaluating!")
     logging.info(f"Test Loss (MSE in normalized space): {test_loss:.4f}")
@@ -71,9 +71,9 @@ if __name__ == "__main__":
     # You can adjust these paths/values as needed
     logging.basicConfig(level=logging.INFO)
 
-    run_folder = r"C:\Users\sa-forest\Documents\GitHub\pipetteFindingCNN\training\train-mobilenetv3-20250215_160856"  # Folder where best_model.pth is saved
-    images_dir = r"C:\Users\sa-forest\Documents\GitHub\pipetteFindingCNN\pipettedata\20191016"                           # Same images used in training
-    annotations_csv = r"C:\Users\sa-forest\Documents\GitHub\pipetteFindingCNN\pipettedata\processed_20191016_final.csv"             # Same CSV used in training
+    run_folder = r"C:\Users\sa-forest\Documents\GitHub\pipetteFindingCNN\training\train-mobilevitv2_050-20260131_211825"  # Folder where best_model.pth is saved
+    images_dir = r"C:\Users\sa-forest\Documents\GitHub\pipetteFindingCNN\pipettedata\3DPrelimData\combined\camera_frames"                           # Same images used in training
+    annotations_csv = r"C:\Users\sa-forest\Documents\GitHub\pipetteFindingCNN\pipettedata\3DPrelimData\combined\pipette_z_data_sampled.csv"            # Same CSV used in training
 
     evaluate_trained_model(
         run_folder=run_folder,
