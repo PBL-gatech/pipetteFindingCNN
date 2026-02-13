@@ -15,6 +15,7 @@ import timm
 from timm.optim import create_optimizer_v2
 from timm.scheduler import create_scheduler_v2
 from functools import partial
+from converter2 import convert_checkpoint_to_torchscript
 
 # Enable faster CUDA kernels when available
 torch.backends.cudnn.benchmark = True
@@ -325,6 +326,15 @@ if __name__ == '__main__':
         focus_inner_um=focus_inner_um, focus_outer_um=focus_outer_um,
         focus_weight_ratio=focus_weight_ratio,
     )
+
+    if best_checkpoint is not None:
+        torchscript_output = os.path.join(run_folder, "PipetteFocuserNet.pt")
+        convert_checkpoint_to_torchscript(
+            checkpoint_path=best_checkpoint,
+            output_path=torchscript_output,
+            model_name=model_name,
+            img_size=img_size,
+        )
     
     model.load_state_dict(torch.load(best_checkpoint))
     criterion = partial(

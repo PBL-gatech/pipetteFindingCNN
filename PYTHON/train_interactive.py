@@ -19,6 +19,7 @@ from train import (
     compute_focus_params,
     weighted_huber_loss,
 )
+from converter2 import convert_checkpoint_to_torchscript
 from data import PipetteDataModule
 
 class TrainingWorker(QThread):
@@ -155,6 +156,13 @@ class TrainingWorker(QThread):
         )
 
         self.log_signal.emit("Training complete. Testing the best model...")
+        torchscript_output = os.path.join(run_folder, "PipetteFocuserNet.pt")
+        convert_checkpoint_to_torchscript(
+            checkpoint_path=best_checkpoint,
+            output_path=torchscript_output,
+            model_name=self.model_name,
+            img_size=self.img_size,
+        )
         model.load_state_dict(torch.load(best_checkpoint))
         criterion = lambda outputs, targets: weighted_huber_loss(
             outputs,
