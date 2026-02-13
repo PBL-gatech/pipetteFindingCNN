@@ -11,8 +11,8 @@ from pathlib import Path
 import torch
 
 # ----- EDIT THESE PATHS / SETTINGS -----
-CHECKPOINT = Path(r"C:\Users\sa-forest\Documents\GitHub\pipetteFindingCNN\training\train-mobilevitv2_050-20260202_143309\best_model_focus_epoch49.pth")
-OUTPUT     = Path(r"C:\Users\sa-forest\Documents\GitHub\pipetteFindingCNN\training\train-mobilevitv2_050-20260202_143309\PipetteFocuserNet.pt")
+CHECKPOINT = Path(r"C:\Users\sa-forest\Documents\GitHub\pipetteFindingCNN\training\train-mobilevitv2_050-20260212_185415\best_model_focus_epoch49.pth")
+OUTPUT     = Path(r"C:\Users\sa-forest\Documents\GitHub\pipetteFindingCNN\training\train-mobilevitv2_050-20260212_185415\PipetteFocuserNet.pt")
 MODEL_NAME = "mobilevitv2_050"  # set to match config.txt if different
 IMG_SIZE   = 224                # set to training img_size if different
 # --------------------------------------

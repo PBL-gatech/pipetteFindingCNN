@@ -120,13 +120,19 @@ def main():
     # base_dir = r"C:\Users\sa-forest\Documents\GitHub\pipetteFindingCNN\pipettedata\3DPrelimData\2026_01_30-18_09"
     # base_dir =r"C:\Users\sa-forest\Documents\GitHub\pipetteFindingCNN\pipettedata\3DPrelimData\2026_01_30-19_28"
     # base_dir = r"C:\Users\sa-forest\Documents\GitHub\pipetteFindingCNN\pipettedata\3DPrelimData\2026_02_02-13_28"
-    base_dir = r"C:\Users\sa-forest\Documents\GitHub\pipetteFindingCNN\pipettedata\3DPrelimData\2026_02_02-13_37"
-    camera_frames_dir = os.path.join(base_dir, "camera_frames")
+    # base_dir = r"C:\Users\sa-forest\Documents\GitHub\pipetteFindingCNN\pipettedata\3DPrelimData\2026_02_02-13_37"
+    base_dir = r"C:\Users\sa-forest\Documents\GitHub\pipetteFindingCNN\pipettedata\3DPrelimData\2026_02_09-16_13"
+    camera_frames_dir = None
+    for folder_name in ("camera_frames", "P_DET_IMAGES"):
+        candidate_dir = os.path.join(base_dir, folder_name)
+        if os.path.exists(candidate_dir):
+            camera_frames_dir = candidate_dir
+            break
     movement_file_path = os.path.join(base_dir, "movement_recording.csv")
     
     # Check for required folders and files
-    if not os.path.exists(camera_frames_dir):
-        print(f"Camera frames directory not found: {camera_frames_dir}")
+    if camera_frames_dir is None:
+        print(f"Camera frames directory not found in: {os.path.join(base_dir, 'camera_frames')} or {os.path.join(base_dir, 'P_DET_IMAGES')}")
         return
     if not os.path.exists(movement_file_path):
         print(f"Movement data file not found: {movement_file_path}")
@@ -156,14 +162,24 @@ def main():
     output_csv_path = os.path.join(camera_frames_dir, "pipette_z_data.csv")
     with open(output_csv_path, mode='w', newline='') as csv_file:
         writer = csv.writer(csv_file)
-        writer.writerow(["filename", "defocus_microns"])
+        writer.writerow(
+            [
+                "filename",
+                "defocus_microns",
+                "pipette_x_microns",
+                "pipette_y_microns",
+                "pipette_z_microns",
+            ]
+        )
         
         # For each image, find the movement record with the closest timestamp
         for img, timestamp in image_files_with_timestamp:
             movement_record = find_closest_movement_record(timestamp, movement_data)
+            pipette_x = float(movement_record['pipette'][0])
+            pipette_y = float(movement_record['pipette'][1])
             # pipette[2] holds the z-axis (defocus) value
             pipette_z = movement_record['pipette'][2]
-            writer.writerow([img, pipette_z])
+            writer.writerow([img, pipette_z, pipette_x, pipette_y, pipette_z])
     
     print(f"CSV file created: {output_csv_path}")
 

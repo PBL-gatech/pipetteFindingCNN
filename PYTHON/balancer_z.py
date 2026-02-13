@@ -1,5 +1,5 @@
 """
-Balance a z-only defocus CSV (filename, defocus_microns).
+Balance a defocus CSV (filename, defocus_microns, optional pipette x/y/z).
 
 Edit the CONFIG section below to point at the CSV you want to balance.
 The script trims extreme defocus values, caps each bin to a fixed sample
@@ -8,6 +8,7 @@ count, and saves a balanced CSV alongside the input.
 
 import os
 import time
+import threading
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -35,6 +36,127 @@ def save_histogram(series, bins, title, filepath, xlabel="Value", show_plot=True
     ax.set_title(title)
     fig.tight_layout()
     fig.savefig(filepath)
+    print(f"Saved histogram: {filepath}")
+    if show_plot:
+        plt.show()
+    plt.close(fig)
+
+
+def find_first_existing_column(df: pd.DataFrame, candidates: list[str]) -> str | None:
+    """Return the first candidate column present in df, else None."""
+    for column in candidates:
+        if column in df.columns:
+            return column
+    return None
+
+
+def resolve_projection_columns(df: pd.DataFrame, target_col: str) -> tuple[str | None, str | None, str]:
+    """
+    Resolve x/y/z columns for projection diagnostics.
+
+    z defaults to target_col, then falls back to known z aliases.
+    """
+    x_col = find_first_existing_column(
+        df,
+        [
+            "pipette_x_microns",
+            "pipette_x",
+            "pi_x",
+            "x_microns",
+            "x",
+        ],
+    )
+    y_col = find_first_existing_column(
+        df,
+        [
+            "pipette_y_microns",
+            "pipette_y",
+            "pi_y",
+            "y_microns",
+            "y",
+        ],
+    )
+
+    z_candidates = [target_col, "pipette_z_microns", "pipette_z", "pi_z", "z_microns", "z"]
+    z_col = find_first_existing_column(df, z_candidates)
+    if z_col is None:
+        raise ValueError(
+            f"No z/target column found. Checked target_col='{target_col}' and known z aliases."
+        )
+    return x_col, y_col, z_col
+
+
+def save_projection_panels(
+    df: pd.DataFrame,
+    x_col: str,
+    y_col: str,
+    z_col: str,
+    title: str,
+    filepath: str,
+    show_plot: bool = False,
+) -> None:
+    """Save x-y, x-z, and y-z 2D projection panels."""
+    fig, axes = plt.subplots(1, 3, figsize=(15, 4.5))
+    plot_specs = [
+        (x_col, y_col, "X-Y projection"),
+        (x_col, z_col, "X-Z projection"),
+        (y_col, z_col, "Y-Z projection"),
+    ]
+
+    n_points = len(df)
+    marker_size = 4 if n_points > 50000 else 7
+    marker_alpha = 0.22 if n_points > 50000 else 0.30
+
+    for ax, (x_axis, y_axis, panel_title) in zip(axes, plot_specs):
+        ax.scatter(
+            df[x_axis],
+            df[y_axis],
+            s=marker_size,
+            alpha=marker_alpha,
+            linewidths=0,
+            edgecolors="none",
+            rasterized=True,
+        )
+        ax.set_xlabel(x_axis)
+        ax.set_ylabel(y_axis)
+        ax.set_title(panel_title)
+        ax.grid(alpha=0.2)
+
+    fig.suptitle(title)
+    fig.tight_layout(rect=(0, 0, 1, 0.95))
+    fig.savefig(filepath, dpi=200)
+    print(f"Saved projections: {filepath}")
+    if show_plot:
+        plt.show()
+    plt.close(fig)
+
+
+def save_projection_placeholder(
+    title: str,
+    filepath: str,
+    message: str,
+    show_plot: bool = False,
+) -> None:
+    """Save a placeholder projection image when x/y columns are unavailable."""
+    fig, axes = plt.subplots(1, 3, figsize=(15, 4.5))
+    for ax, panel_title in zip(axes, ["X-Y projection", "X-Z projection", "Y-Z projection"]):
+        ax.set_title(panel_title)
+        ax.text(
+            0.5,
+            0.5,
+            message,
+            ha="center",
+            va="center",
+            wrap=True,
+            fontsize=10,
+        )
+        ax.set_xticks([])
+        ax.set_yticks([])
+        ax.set_frame_on(True)
+    fig.suptitle(title)
+    fig.tight_layout(rect=(0, 0, 1, 0.95))
+    fig.savefig(filepath, dpi=200)
+    print(f"Saved projections placeholder: {filepath}")
     if show_plot:
         plt.show()
     plt.close(fig)
@@ -75,8 +197,17 @@ def balance_defocus(
     seed: int = 42,
     show_plots: bool = False,
 ) -> str:
-    df = pd.read_csv(input_path)
-    rows_before_cull = len(df)
+    if threading.current_thread() is not threading.main_thread():
+        try:
+            plt.switch_backend("Agg")
+        except Exception as exc:
+            print(f"Warning: could not switch matplotlib backend to Agg: {exc}")
+        if show_plots:
+            print("show_plots=True requested outside main thread; disabling interactive plot display.")
+            show_plots = False
+
+    source_df = pd.read_csv(input_path)
+    rows_before_cull = len(source_df)
 
     directory = os.path.dirname(input_path)
     base = os.path.basename(input_path)
@@ -85,19 +216,35 @@ def balance_defocus(
     output_path = os.path.join(artifacts_dir, base.replace(".csv", "_sampled.csv"))
     os.makedirs(artifacts_dir, exist_ok=True)
 
-    if target_col not in df.columns:
-        target_col = df.columns[-1]
+    if target_col not in source_df.columns:
+        target_col = source_df.columns[-1]
         print(f"Target column '{target_col}' inferred from last column.")
+
+    x_col, y_col, z_col = resolve_projection_columns(source_df, target_col)
+    if z_col != target_col:
+        print(f"Using '{z_col}' as target column for balancing.")
+        target_col = z_col
+
+    df_before_cull = source_df.copy()
 
     # Optional symmetric culling
     if cull_limit is not None:
-        df = df[(df[target_col] >= -cull_limit) & (df[target_col] <= cull_limit)]
+        df = df_before_cull[
+            (df_before_cull[target_col] >= -cull_limit) & (df_before_cull[target_col] <= cull_limit)
+        ].copy()
         print(f"After culling to +/-{cull_limit}: {len(df)} rows remain.")
     else:
+        df = df_before_cull.copy()
         print(f"No culling applied. Rows loaded: {len(df)}.")
 
     if df.empty:
         raise ValueError("No data left after culling; adjust limits and retry.")
+
+    if x_col is None or y_col is None:
+        print(
+            "X/Y columns not found for projection scatter plots. "
+            f"Detected x_col={x_col}, y_col={y_col}, z_col={target_col}."
+        )
 
     bins = build_variable_bins(
         df[target_col],
@@ -106,11 +253,11 @@ def balance_defocus(
         outer_step=OUTER_STEP,
     )
 
-    hist_before_path = os.path.join(artifacts_dir, "hist_before.png")
+    hist_before_path = os.path.join(artifacts_dir, "hist_before_balancing.png")
     save_histogram(
         df[target_col],
         bins=bins,
-        title="Histogram before balancing",
+        title="Histogram before balancing (post-cull)",
         filepath=hist_before_path,
         xlabel=target_col,
         show_plot=show_plots,
@@ -132,7 +279,7 @@ def balance_defocus(
         )
     )
 
-    hist_after_path = os.path.join(artifacts_dir, "hist_after.png")
+    hist_after_path = os.path.join(artifacts_dir, "hist_after_balancing.png")
     save_histogram(
         capped_df[target_col],
         bins=bins,
@@ -141,6 +288,52 @@ def balance_defocus(
         xlabel=target_col,
         show_plot=show_plots,
     )
+
+    projections_before_balancing_path = os.path.join(
+        artifacts_dir,
+        "projections_before_balancing.png",
+    )
+    projections_after_balancing_path = os.path.join(
+        artifacts_dir,
+        "projections_after_balancing.png",
+    )
+    projections_generated = x_col is not None and y_col is not None
+    if projections_generated:
+        save_projection_panels(
+            df,
+            x_col=x_col,
+            y_col=y_col,
+            z_col=target_col,
+            title="Pipette position projections before balancing (post-cull)",
+            filepath=projections_before_balancing_path,
+            show_plot=show_plots,
+        )
+        save_projection_panels(
+            capped_df,
+            x_col=x_col,
+            y_col=y_col,
+            z_col=target_col,
+            title=f"Pipette position projections after balancing (cap {cap_per_bin} per bin)",
+            filepath=projections_after_balancing_path,
+            show_plot=show_plots,
+        )
+    else:
+        missing_message = (
+            "Projection scatter unavailable.\n"
+            f"Need X and Y columns.\nFound x_col={x_col}, y_col={y_col}."
+        )
+        save_projection_placeholder(
+            title="Pipette position projections before balancing",
+            filepath=projections_before_balancing_path,
+            message=missing_message,
+            show_plot=show_plots,
+        )
+        save_projection_placeholder(
+            title="Pipette position projections after balancing",
+            filepath=projections_after_balancing_path,
+            message=missing_message,
+            show_plot=show_plots,
+        )
 
     # Save descriptive statistics and bin counts
     overall_stats = pd.DataFrame(
@@ -172,6 +365,14 @@ def balance_defocus(
         ("artifacts_dir", artifacts_dir),
         ("timestamp_unix", run_ts),
         ("cull_limit", cull_limit),
+        ("projection_x_col", x_col or ""),
+        ("projection_y_col", y_col or ""),
+        ("projection_z_col", target_col),
+        ("projection_plots_generated", projections_generated),
+        ("hist_before_balancing_path", hist_before_path),
+        ("hist_after_balancing_path", hist_after_path),
+        ("projections_before_balancing_path", projections_before_balancing_path),
+        ("projections_after_balancing_path", projections_after_balancing_path),
         ("inner_half_width", INNER_HALF_WIDTH),
         ("inner_step", INNER_STEP),
         ("outer_step", OUTER_STEP),
@@ -179,6 +380,7 @@ def balance_defocus(
         ("seed", seed),
         ("rows_before_cull", rows_before_cull),
         ("rows_after_cull", len(df)),
+        ("rows_removed_by_cull", rows_before_cull - len(df)),
         ("rows_after_cap", len(balanced_df)),
         ("bin_count", len(bins) - 1),
     ]
