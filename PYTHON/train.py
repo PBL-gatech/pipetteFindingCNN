@@ -75,7 +75,7 @@ def compute_focus_params(dataset, inner_band_um: float, manual_weight_ratio: flo
     return outer_band_um, weight_ratio
 
 
-def weighted_huber_loss(outputs, targets, beta, z_mean, z_std, inner_band_um, weight_ratio):
+def weighted_huber_loss(outputs, targets, beta, z_mean, z_std, inner_band_um, weight_ratio, neg_weight_ratio: float = 1.0):
     """
     Per-sample Huber (SmoothL1) with higher weight inside the focus band.
     Targets/outputs are in normalized space; weighting is computed in microns.
@@ -84,6 +84,13 @@ def weighted_huber_loss(outputs, targets, beta, z_mean, z_std, inner_band_um, we
     inner_w = torch.as_tensor(weight_ratio, device=targets.device, dtype=outputs.dtype)
     outer_w = torch.as_tensor(1.0, device=targets.device, dtype=outputs.dtype)
     weights = torch.where(torch.abs(microns) <= inner_band_um, inner_w, outer_w)
+
+    # Give negative-defocus samples (above focal plane) extra emphasis.
+    if neg_weight_ratio != 1.0:
+        neg_mask = microns < 0
+        neg_scale = torch.as_tensor(neg_weight_ratio, device=targets.device, dtype=outputs.dtype)
+        weights = torch.where(neg_mask, weights * neg_scale, weights)
+
     per_sample = F.smooth_l1_loss(outputs, targets, beta=beta, reduction="none")
     return (weights * per_sample).mean()
 
@@ -95,7 +102,8 @@ def train_and_validate(model, train_loader, val_loader, device, run_folder,
                        logger=print, compile_model: bool = False,
                        focus_inner_um: float = 3.0,
                        focus_outer_um: float | None = None,
-                       focus_weight_ratio: float | None = None):
+                       focus_weight_ratio: float | None = None,
+                       negative_weight_ratio: float = 1.0):
     # Ensure model is on device and in channels-last for better GPU throughput
     logger(f"Device selected: {device} | CUDA available: {torch.cuda.is_available()}")
     if device.type == "cuda":
@@ -142,6 +150,7 @@ def train_and_validate(model, train_loader, val_loader, device, run_folder,
         z_std=z_std,
         inner_band_um=focus_inner_um,
         weight_ratio=focus_weight_ratio,
+        neg_weight_ratio=negative_weight_ratio,
     )
     scaler = torch.amp.GradScaler() if device.type == "cuda" else None
 
@@ -150,6 +159,7 @@ def train_and_validate(model, train_loader, val_loader, device, run_folder,
     
     train_losses, val_losses = [], []
     mae_scores, r2_scores = [], []
+    mae_scores_pos, mae_scores_neg = [], []
     epochs_list = []
 
     num_updates = 0
@@ -204,22 +214,57 @@ def train_and_validate(model, train_loader, val_loader, device, run_folder,
         targets_real = targets_cat * z_std + z_mean
 
         mae = torch.mean(torch.abs(preds_real - targets_real)).item()
+        pos_mask = targets_real >= 0
+        neg_mask = targets_real < 0
+        mae_pos = (
+            torch.mean(torch.abs(preds_real[pos_mask] - targets_real[pos_mask])).item()
+            if torch.any(pos_mask)
+            else float("nan")
+        )
+        mae_neg = (
+            torch.mean(torch.abs(preds_real[neg_mask] - targets_real[neg_mask])).item()
+            if torch.any(neg_mask)
+            else float("nan")
+        )
         ss_res = torch.sum((targets_real - preds_real) ** 2)
         ss_tot = torch.sum((targets_real - torch.mean(targets_real)) ** 2) + 1e-8
         r2 = 1 - ss_res / ss_tot
 
         mae_scores.append(mae)
         r2_scores.append(r2.item())
+        mae_scores_pos.append(mae_pos)
+        mae_scores_neg.append(mae_neg)
         epochs_list.append(epoch+1)
 
         epoch_time = time.time() - epoch_start
         imgs_per_sec = len(train_loader.dataset) / epoch_time if epoch_time > 0 else 0.0
-        logger(f"Epoch {epoch+1}/{num_epochs}: Train Loss: {train_loss:.4f}  Val Loss: {val_loss:.4f}  MAE: {mae:.4f}  R^2: {r2:.4f}  | imgs/sec: {imgs_per_sec:.1f}")
+        logger(
+            "Epoch {}/{}: Train Loss: {:.4f}  Val Loss: {:.4f}  MAE: {:.4f}  "
+            "MAE Neg: {:.4f}  MAE Pos: {:.4f}  R^2: {:.4f}  | imgs/sec: {:.1f}".format(
+                epoch + 1,
+                num_epochs,
+                train_loss,
+                val_loss,
+                mae,
+                mae_neg if mae_neg == mae_neg else 0.0,
+                mae_pos if mae_pos == mae_pos else 0.0,
+                r2,
+                imgs_per_sec,
+            )
+        )
         
         scheduler.step(epoch + 1)
 
         if update and (update_callback is not None):
-            update_callback(epoch+1, train_loss, val_loss, mae, r2.item())
+            update_callback(
+                epoch + 1,
+                train_loss,
+                val_loss,
+                mae,
+                mae_pos,
+                mae_neg,
+                r2.item(),
+            )
 
         if val_loss < best_val_loss:
             best_val_loss = val_loss
@@ -228,9 +273,25 @@ def train_and_validate(model, train_loader, val_loader, device, run_folder,
             logger(f"Best model updated and saved to {best_checkpoint}")
 
         plot_training_metrics(epochs_list, train_losses, val_losses, os.path.join(run_folder, "loss.png"))
-        plot_regression_metrics(epochs_list, mae_scores, r2_scores, os.path.join(run_folder, "metrics.png"))
+        plot_regression_metrics(
+            epochs_list,
+            mae_scores,
+            r2_scores,
+            os.path.join(run_folder, "metrics.png"),
+            mae_scores_pos=mae_scores_pos,
+            mae_scores_neg=mae_scores_neg,
+        )
     
-    return best_checkpoint, epochs_list, train_losses, val_losses, mae_scores, r2_scores
+    return (
+        best_checkpoint,
+        epochs_list,
+        train_losses,
+        val_losses,
+        mae_scores,
+        r2_scores,
+        mae_scores_pos,
+        mae_scores_neg,
+    )
 
 # --- Testing Function ---
 def test_model(model, test_loader, device, criterion, run_folder):
@@ -276,6 +337,7 @@ if __name__ == '__main__':
     num_epochs = 50
     huber_beta = 1.0
     focus_inner_um = 3.0
+    negative_weight_ratio = 2.0
     config = {
         "model_name": model_name,
         "batch_size": 32,
@@ -285,6 +347,7 @@ if __name__ == '__main__':
         "img_size": 224,
         "huber_beta": huber_beta,
         "focus_inner_um": focus_inner_um,
+        "negative_weight_ratio": negative_weight_ratio,
     }
     run_folder = create_run_folder(model_name, config=config)
     print("Run folder created at:", run_folder)
@@ -320,11 +383,21 @@ if __name__ == '__main__':
     val_loader   = DataLoader(val_dataset, batch_size=32, shuffle=False, **loader_kwargs)
     test_loader  = DataLoader(test_dataset, batch_size=32, shuffle=False, **loader_kwargs)
     
-    best_checkpoint, epochs_list, train_losses, val_losses, mae_scores, r2_scores = train_and_validate(
+    (
+        best_checkpoint,
+        epochs_list,
+        train_losses,
+        val_losses,
+        mae_scores,
+        r2_scores,
+        _mae_scores_pos,
+        _mae_scores_neg,
+    ) = train_and_validate(
         model, train_loader, val_loader, device, run_folder, num_epochs=num_epochs,
         learning_rate=learning_rate, huber_beta=huber_beta,
         focus_inner_um=focus_inner_um, focus_outer_um=focus_outer_um,
         focus_weight_ratio=focus_weight_ratio,
+        negative_weight_ratio=negative_weight_ratio,
     )
 
     if best_checkpoint is not None:
@@ -344,5 +417,6 @@ if __name__ == '__main__':
         z_std=getattr(train_dataset, "z_std", 1.0),
         inner_band_um=focus_inner_um,
         weight_ratio=focus_weight_ratio,
+        neg_weight_ratio=negative_weight_ratio,
     )
     test_results = test_model(model, test_loader, device, criterion, run_folder)

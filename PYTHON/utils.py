@@ -74,9 +74,20 @@ def plot_training_metrics(epochs, train_losses, val_losses, save_path):
     fig.savefig(save_path)
     plt.close(fig)
 
-def plot_regression_metrics(epochs, mae_scores, r2_scores, save_path):
+def plot_regression_metrics(
+    epochs,
+    mae_scores,
+    r2_scores,
+    save_path,
+    mae_scores_pos=None,
+    mae_scores_neg=None,
+):
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
     ax1.plot(epochs, mae_scores, label="MAE", color="orange", lw=2)
+    if mae_scores_pos is not None:
+        ax1.plot(epochs, mae_scores_pos, label="MAE positive", color="cyan", lw=1.8, alpha=0.9)
+    if mae_scores_neg is not None:
+        ax1.plot(epochs, mae_scores_neg, label="MAE negative", color="magenta", lw=1.8, alpha=0.9)
     ax1.set_title("Mean Absolute Error Over Epochs")
     ax1.set_xlabel("Epoch")
     ax1.set_ylabel("MAE (microns)")
