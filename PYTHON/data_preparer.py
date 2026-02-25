@@ -1,6 +1,20 @@
 # data preparer
 import os
 import csv
+import json
+from pathlib import Path
+
+import cv2
+import numpy as np
+
+
+POSITION_COLUMN_CANDIDATES = (
+    "pipette_z_microns",
+    "defocus_microns",
+    "pipette_z",
+    "z_microns",
+    "z",
+)
 
 def zero_initial_position(movement_data):
     """
@@ -106,6 +120,246 @@ def find_closest_movement_record(image_timestamp, movement_data):
     return min(movement_data, key=lambda record: abs(record['time'] - image_timestamp))
 
 
+def load_calibration_matrix_xy(calibration_path):
+    """
+    Load the manip/pipette affine matrix and return its XY projection (2x3).
+    """
+    if not os.path.exists(calibration_path):
+        raise FileNotFoundError(f"Calibration file not found: {calibration_path}")
+
+    with open(calibration_path, "r", encoding="utf-8") as calibration_file:
+        calibration = json.load(calibration_file)
+
+    manip_entry = calibration.get("manip") or calibration.get("pipette") or calibration
+    if "M" not in manip_entry:
+        raise ValueError("Calibration file missing manip/pipette matrix 'M'.")
+
+    matrix = np.asarray(manip_entry["M"], dtype=np.float64)
+    if matrix.ndim != 2 or matrix.shape[0] < 2 or matrix.shape[1] < 3:
+        raise ValueError(f"Unexpected calibration matrix shape: {matrix.shape}")
+    return matrix[:2, :3]
+
+
+def crop_tip_roi_256(
+    image_path: str,
+    output_path: str,
+    manip_matrix_xy: np.ndarray,
+    zeroed_pipette_xyz: np.ndarray,
+    crop_size: int = 256,
+) -> tuple[bool, str]:
+    """
+    Crop a fixed square ROI around projected pipette tip position.
+    """
+    image = cv2.imread(image_path, cv2.IMREAD_COLOR)
+    if image is None:
+        return False, "unreadable_image"
+
+    image_height, image_width = image.shape[:2]
+    if image_width < crop_size or image_height < crop_size:
+        return False, "image_too_small"
+
+    pixel_delta_xy = manip_matrix_xy @ zeroed_pipette_xyz
+    center_x = (image_width / 2.0) + float(pixel_delta_xy[0])
+    center_y = (image_height / 2.0) + float(pixel_delta_xy[1])
+
+    half = crop_size / 2.0
+    x1 = int(round(center_x - half))
+    y1 = int(round(center_y - half))
+
+    # Clamp to image bounds so we keep a fixed crop size whenever possible.
+    x1 = max(0, min(x1, image_width - crop_size))
+    y1 = max(0, min(y1, image_height - crop_size))
+    x2 = x1 + crop_size
+    y2 = y1 + crop_size
+
+    crop = image[y1:y2, x1:x2]
+    if crop.shape[0] != crop_size or crop.shape[1] != crop_size:
+        return False, "invalid_crop_shape"
+
+    output_parent = os.path.dirname(output_path)
+    if output_parent:
+        os.makedirs(output_parent, exist_ok=True)
+    if not cv2.imwrite(output_path, crop):
+        return False, "write_failed"
+
+    return True, "ok"
+
+
+def detect_focus_position_column(csv_path: str | Path, requested_column: str | None = None) -> str:
+    """
+    Detect which CSV column should be treated as the recorded position for plotting.
+    """
+    csv_path = Path(csv_path)
+    with csv_path.open("r", newline="", encoding="utf-8") as handle:
+        reader = csv.DictReader(handle)
+        fieldnames = reader.fieldnames or []
+
+    if not fieldnames:
+        raise ValueError(f"CSV has no header: {csv_path}")
+    if "filename" not in fieldnames:
+        raise ValueError(f"CSV missing required 'filename' column: {csv_path}")
+
+    if requested_column:
+        if requested_column not in fieldnames:
+            raise ValueError(
+                f"Requested position column '{requested_column}' not found. "
+                f"Available columns: {fieldnames}"
+            )
+        return requested_column
+
+    for candidate in POSITION_COLUMN_CANDIDATES:
+        if candidate in fieldnames:
+            return candidate
+
+    raise ValueError(
+        "Could not detect position column. "
+        f"Checked: {POSITION_COLUMN_CANDIDATES}. Available: {fieldnames}"
+    )
+
+
+def resolve_focus_images_dir(csv_path: str | Path, images_dir_arg: str | None = None) -> Path:
+    """
+    Resolve the folder containing images listed in a final pipette_z_data CSV.
+    """
+    if images_dir_arg:
+        images_dir = Path(images_dir_arg).expanduser().resolve()
+        if not images_dir.is_dir():
+            raise FileNotFoundError(f"Image directory not found: {images_dir}")
+        return images_dir
+
+    csv_path = Path(csv_path).expanduser().resolve()
+    candidates = [
+        csv_path.parent / "camera_frames",
+        csv_path.parent.parent / "camera_frames",
+    ]
+    for candidate in candidates:
+        if candidate.is_dir():
+            return candidate.resolve()
+
+    raise FileNotFoundError(
+        "Could not auto-detect camera_frames folder. "
+        "Pass --images-dir explicitly."
+    )
+
+
+def resolve_focus_image_path(images_dir: str | Path, filename_value: str) -> Path | None:
+    """
+    Resolve an image filename/path value from the CSV to a readable local path.
+    """
+    filename_value = filename_value.strip()
+    if not filename_value:
+        return None
+
+    images_dir = Path(images_dir)
+    raw_path = Path(filename_value)
+    if raw_path.is_absolute() and raw_path.is_file():
+        return raw_path
+
+    candidate = images_dir / raw_path
+    if candidate.is_file():
+        return candidate
+
+    by_name = images_dir / raw_path.name
+    if by_name.is_file():
+        return by_name
+
+    return None
+
+
+def compute_laplacian_variance(image_path: str | Path, median_ksize: int = 5) -> float:
+    """
+    Compute focus score as variance of the Laplacian after median blur.
+    """
+    if median_ksize < 1 or median_ksize % 2 == 0:
+        raise ValueError("median_ksize must be a positive odd integer.")
+
+    image = cv2.imread(str(image_path), cv2.IMREAD_GRAYSCALE)
+    if image is None:
+        raise ValueError(f"Failed to read image: {image_path}")
+
+    filtered = cv2.medianBlur(image, median_ksize) if median_ksize > 1 else image
+    laplacian = cv2.Laplacian(filtered, cv2.CV_64F)
+    return float(laplacian.var())
+
+
+def load_focus_points_from_final_csv(
+    csv_path: str | Path,
+    images_dir_arg: str | None = None,
+    requested_position_column: str | None = None,
+    median_ksize: int = 5,
+    max_rows: int | None = None,
+) -> tuple[str, Path, list[dict[str, str | float]]]:
+    """
+    Read final dataset CSV rows and compute Laplacian variance per listed image.
+    Returns:
+      - resolved position column name
+      - resolved image directory
+      - points list with filename/image_path/position_value/laplacian_variance
+    """
+    csv_path = Path(csv_path).expanduser().resolve()
+    if not csv_path.is_file():
+        raise FileNotFoundError(f"CSV file not found: {csv_path}")
+    if max_rows is not None and max_rows <= 0:
+        raise ValueError("max_rows must be a positive integer.")
+
+    position_col = detect_focus_position_column(
+        csv_path=csv_path,
+        requested_column=requested_position_column,
+    )
+    images_dir = resolve_focus_images_dir(csv_path=csv_path, images_dir_arg=images_dir_arg)
+
+    points: list[dict[str, str | float]] = []
+    skipped_missing_file = 0
+    skipped_bad_position = 0
+    skipped_unreadable = 0
+
+    with csv_path.open("r", newline="", encoding="utf-8") as handle:
+        reader = csv.DictReader(handle)
+        for row_index, row in enumerate(reader, start=1):
+            if max_rows is not None and row_index > max_rows:
+                break
+
+            filename_value = (row.get("filename") or "").strip()
+            image_path = resolve_focus_image_path(images_dir, filename_value)
+            if image_path is None:
+                skipped_missing_file += 1
+                continue
+
+            position_value_raw = (row.get(position_col) or "").strip()
+            try:
+                position_value = float(position_value_raw)
+            except ValueError:
+                skipped_bad_position += 1
+                continue
+
+            try:
+                lap_var = compute_laplacian_variance(image_path, median_ksize=median_ksize)
+            except Exception:
+                skipped_unreadable += 1
+                continue
+
+            points.append(
+                {
+                    "filename": filename_value,
+                    "image_path": str(image_path),
+                    "position_value": position_value,
+                    "laplacian_variance": lap_var,
+                }
+            )
+
+            if len(points) % 250 == 0:
+                print(f"Processed {len(points)} usable rows...")
+
+    print(
+        "Summary: "
+        f"usable={len(points)}, "
+        f"skipped_missing_file={skipped_missing_file}, "
+        f"skipped_bad_position={skipped_bad_position}, "
+        f"skipped_unreadable={skipped_unreadable}"
+    )
+    return position_col, images_dir, points
+
+
 
 
 def main():
@@ -122,6 +376,11 @@ def main():
     # base_dir = r"C:\Users\sa-forest\Documents\GitHub\pipetteFindingCNN\pipettedata\3DPrelimData\2026_02_02-13_28"
     # base_dir = r"C:\Users\sa-forest\Documents\GitHub\pipetteFindingCNN\pipettedata\3DPrelimData\2026_02_02-13_37"
     base_dir = r"C:\Users\sa-forest\Documents\GitHub\pipetteFindingCNN\pipettedata\3DPrelimData\2026_02_09-16_13"
+    calibration_path = (
+        r"C:\Users\sa-forest\Documents\GitHub\PatcherBot-Agent\experiments\Data\Calibration_data"
+        r"\2025_11_10-13_19\calibration.json"
+    )
+    crop_size = 256
     camera_frames_dir = None
     for folder_name in ("camera_frames", "P_DET_IMAGES"):
         candidate_dir = os.path.join(base_dir, folder_name)
@@ -129,6 +388,7 @@ def main():
             camera_frames_dir = candidate_dir
             break
     movement_file_path = os.path.join(base_dir, "movement_recording.csv")
+    cropped_camera_frames_dir = os.path.join(base_dir, "cropped_camera_frames")
     
     # Check for required folders and files
     if camera_frames_dir is None:
@@ -143,6 +403,11 @@ def main():
     if not movement_data:
         print("No movement data loaded.")
         return
+    try:
+        manip_matrix_xy = load_calibration_matrix_xy(calibration_path)
+    except Exception as exc:
+        print(f"Failed to load calibration matrix: {exc}")
+        return
 
     # Get list of image files (adjust extensions as needed)
     image_extensions = ('.png', '.jpg', '.jpeg', '.webp')
@@ -150,6 +415,7 @@ def main():
     if not image_files:
         print(f"No image files found in {camera_frames_dir}")
         return
+    os.makedirs(cropped_camera_frames_dir, exist_ok=True)
     
     # Extract timestamps from filenames and sort images by timestamp
     image_files_with_timestamp = []
@@ -160,6 +426,9 @@ def main():
     
     # Create CSV file in the camera_frames folder
     output_csv_path = os.path.join(camera_frames_dir, "pipette_z_data.csv")
+    cropped_written = 0
+    cropped_skipped = 0
+    skip_reasons = {}
     with open(output_csv_path, mode='w', newline='') as csv_file:
         writer = csv.writer(csv_file)
         writer.writerow(
@@ -178,10 +447,32 @@ def main():
             pipette_x = float(movement_record['pipette'][0])
             pipette_y = float(movement_record['pipette'][1])
             # pipette[2] holds the z-axis (defocus) value
-            pipette_z = movement_record['pipette'][2]
+            pipette_z = float(movement_record['pipette'][2])
             writer.writerow([img, pipette_z, pipette_x, pipette_y, pipette_z])
-    
+
+            source_image_path = os.path.join(camera_frames_dir, img)
+            cropped_output_path = os.path.join(cropped_camera_frames_dir, img)
+            zeroed_pipette_xyz = np.asarray([pipette_x, pipette_y, pipette_z], dtype=np.float64)
+            success, reason = crop_tip_roi_256(
+                image_path=source_image_path,
+                output_path=cropped_output_path,
+                manip_matrix_xy=manip_matrix_xy,
+                zeroed_pipette_xyz=zeroed_pipette_xyz,
+                crop_size=crop_size,
+            )
+            if success:
+                cropped_written += 1
+            else:
+                cropped_skipped += 1
+                skip_reasons[reason] = skip_reasons.get(reason, 0) + 1
+
     print(f"CSV file created: {output_csv_path}")
+    print(
+        f"Cropped images written: {cropped_written}, skipped: {cropped_skipped}, "
+        f"output folder: {cropped_camera_frames_dir}"
+    )
+    if skip_reasons:
+        print(f"Crop skip reasons: {skip_reasons}")
 
 if __name__ == "__main__":
     main()
