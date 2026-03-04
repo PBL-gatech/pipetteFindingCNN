@@ -15,6 +15,17 @@ POSITION_COLUMN_CANDIDATES = (
     "z_microns",
     "z",
 )
+DEFAULT_GABOR_THETAS = (
+    0.0,
+    np.pi / 4.0,
+    np.pi / 2.0,
+    3.0 * np.pi / 4.0,
+)
+
+
+def _validate_odd_kernel(name: str, value: int) -> None:
+    if value < 1 or value % 2 == 0:
+        raise ValueError(f"{name} must be a positive odd integer.")
 
 def zero_initial_position(movement_data):
     """
@@ -270,8 +281,7 @@ def compute_laplacian_variance(image_path: str | Path, median_ksize: int = 5) ->
     """
     Compute focus score as variance of the Laplacian after median blur.
     """
-    if median_ksize < 1 or median_ksize % 2 == 0:
-        raise ValueError("median_ksize must be a positive odd integer.")
+    _validate_odd_kernel("median_ksize", median_ksize)
 
     image = cv2.imread(str(image_path), cv2.IMREAD_GRAYSCALE)
     if image is None:
@@ -282,6 +292,82 @@ def compute_laplacian_variance(image_path: str | Path, median_ksize: int = 5) ->
     return float(laplacian.var())
 
 
+def compute_focus_scores(
+    image_path: str | Path,
+    median_ksize: int = 5,
+    log_gaussian_ksize: int = 5,
+    sobel_ksize: int = 3,
+    gabor_ksize: int = 21,
+    gabor_sigma: float = 5.0,
+    gabor_lambda: float = 10.0,
+    gabor_gamma: float = 0.5,
+    gabor_thetas: tuple[float, ...] = DEFAULT_GABOR_THETAS,
+) -> dict[str, float]:
+    """
+    Compute multiple sharpness scores from one image:
+      - Laplacian variance
+      - LoG variance (Laplacian of Gaussian-smoothed image)
+      - Sobel score (mean gradient energy / Tenengrad-style)
+      - Gabor score (mean response energy over multiple orientations)
+    """
+    _validate_odd_kernel("median_ksize", median_ksize)
+    _validate_odd_kernel("log_gaussian_ksize", log_gaussian_ksize)
+    _validate_odd_kernel("sobel_ksize", sobel_ksize)
+    _validate_odd_kernel("gabor_ksize", gabor_ksize)
+    if gabor_sigma <= 0.0:
+        raise ValueError("gabor_sigma must be > 0.")
+    if gabor_lambda <= 0.0:
+        raise ValueError("gabor_lambda must be > 0.")
+    if gabor_gamma <= 0.0:
+        raise ValueError("gabor_gamma must be > 0.")
+    if not gabor_thetas:
+        raise ValueError("gabor_thetas must contain at least one orientation.")
+
+    image = cv2.imread(str(image_path), cv2.IMREAD_GRAYSCALE)
+    if image is None:
+        raise ValueError(f"Failed to read image: {image_path}")
+
+    filtered = cv2.medianBlur(image, median_ksize) if median_ksize > 1 else image
+
+    laplacian = cv2.Laplacian(filtered, cv2.CV_64F)
+    laplacian_variance = float(laplacian.var())
+
+    gaussian_smoothed = cv2.GaussianBlur(
+        filtered,
+        (log_gaussian_ksize, log_gaussian_ksize),
+        0.0,
+    )
+    log_response = cv2.Laplacian(gaussian_smoothed, cv2.CV_64F)
+    log_variance = float(log_response.var())
+
+    sobel_x = cv2.Sobel(filtered, cv2.CV_64F, 1, 0, ksize=sobel_ksize)
+    sobel_y = cv2.Sobel(filtered, cv2.CV_64F, 0, 1, ksize=sobel_ksize)
+    sobel_score = float(np.mean(sobel_x * sobel_x + sobel_y * sobel_y))
+
+    filtered_float = filtered.astype(np.float64, copy=False)
+    gabor_energies: list[float] = []
+    for theta in gabor_thetas:
+        kernel = cv2.getGaborKernel(
+            (gabor_ksize, gabor_ksize),
+            gabor_sigma,
+            float(theta),
+            gabor_lambda,
+            gabor_gamma,
+            0.0,
+            ktype=cv2.CV_64F,
+        )
+        response = cv2.filter2D(filtered_float, cv2.CV_64F, kernel)
+        gabor_energies.append(float(np.mean(response * response)))
+    gabor_score = float(np.mean(gabor_energies))
+
+    return {
+        "laplacian_variance": laplacian_variance,
+        "log_variance": log_variance,
+        "sobel_score": sobel_score,
+        "gabor_score": gabor_score,
+    }
+
+
 def load_focus_points_from_final_csv(
     csv_path: str | Path,
     images_dir_arg: str | None = None,
@@ -290,11 +376,12 @@ def load_focus_points_from_final_csv(
     max_rows: int | None = None,
 ) -> tuple[str, Path, list[dict[str, str | float]]]:
     """
-    Read final dataset CSV rows and compute Laplacian variance per listed image.
+    Read final dataset CSV rows and compute focus scores per listed image.
     Returns:
       - resolved position column name
       - resolved image directory
-      - points list with filename/image_path/position_value/laplacian_variance
+      - points list with filename/image_path/position_value and score fields:
+        laplacian_variance, log_variance, sobel_score, gabor_score
     """
     csv_path = Path(csv_path).expanduser().resolve()
     if not csv_path.is_file():
@@ -333,7 +420,7 @@ def load_focus_points_from_final_csv(
                 continue
 
             try:
-                lap_var = compute_laplacian_variance(image_path, median_ksize=median_ksize)
+                scores = compute_focus_scores(image_path, median_ksize=median_ksize)
             except Exception:
                 skipped_unreadable += 1
                 continue
@@ -343,7 +430,10 @@ def load_focus_points_from_final_csv(
                     "filename": filename_value,
                     "image_path": str(image_path),
                     "position_value": position_value,
-                    "laplacian_variance": lap_var,
+                    "laplacian_variance": scores["laplacian_variance"],
+                    "log_variance": scores["log_variance"],
+                    "sobel_score": scores["sobel_score"],
+                    "gabor_score": scores["gabor_score"],
                 }
             )
 

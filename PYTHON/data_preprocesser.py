@@ -6,8 +6,8 @@ This tool reuses:
 - balancer_z.py for dataset balancing and artifact/statistics output
 
 It also supports a CLI plot mode:
-- compute Laplacian variance for images listed in a final CSV
-- plot Laplacian variance vs recorded position (two axes)
+- compute focus scores for images listed in a final CSV
+- plot filter scores vs recorded position (Laplacian, LoG, Sobel, Gabor)
 """
 
 from __future__ import annotations
@@ -64,6 +64,38 @@ CROPPED_CAMERA_FRAMES_DIR = "cropped_camera_frames"
 DEFAULT_CROP_SIZE = 256
 PREPROCESS_STATE_FILE = "preprocess_state.json"
 CROPPED_OUTLIER_ZSCORE = 3.0
+FOCUS_METRIC_ORDER = (
+    "laplacian_variance",
+    "log_variance",
+    "sobel_score",
+    "gabor_score",
+)
+FOCUS_METRIC_SPECS: dict[str, dict[str, str]] = {
+    "laplacian_variance": {
+        "display_name": "Laplacian",
+        "score_label": "Laplacian variance",
+        "plot_title": "Laplacian Variance vs Recorded Position",
+        "file_stem": "laplacian_variance_vs_position",
+    },
+    "log_variance": {
+        "display_name": "LoG",
+        "score_label": "LoG variance",
+        "plot_title": "LoG Variance vs Recorded Position",
+        "file_stem": "log_variance_vs_position",
+    },
+    "sobel_score": {
+        "display_name": "Sobel",
+        "score_label": "Sobel score",
+        "plot_title": "Sobel Score vs Recorded Position",
+        "file_stem": "sobel_score_vs_position",
+    },
+    "gabor_score": {
+        "display_name": "Gabor",
+        "score_label": "Gabor score",
+        "plot_title": "Gabor Score vs Recorded Position",
+        "file_stem": "gabor_score_vs_position",
+    },
+}
 
 
 def find_image_folder(session_dir: str) -> Optional[str]:
@@ -248,65 +280,90 @@ def has_reusable_artifacts(state: dict[str, object], run_signature: str) -> bool
         return False
 
     balanced_csv_path = str(state.get("balanced_csv_path", ""))
-    laplacian_plot_path = str(state.get("laplacian_plot_path", ""))
-    laplacian_csv_path = str(state.get("laplacian_csv_path", ""))
-    if not balanced_csv_path or not laplacian_plot_path or not laplacian_csv_path:
+    if not balanced_csv_path or not os.path.isfile(balanced_csv_path):
         return False
-    return (
-        os.path.isfile(balanced_csv_path)
-        and os.path.isfile(laplacian_plot_path)
-        and os.path.isfile(laplacian_csv_path)
-    )
+
+    metric_artifacts = state.get("metric_artifacts")
+    if not isinstance(metric_artifacts, dict):
+        return False
+    for metric_name in FOCUS_METRIC_ORDER:
+        metric_entry = metric_artifacts.get(metric_name)
+        if not isinstance(metric_entry, dict):
+            return False
+        plot_path = str(metric_entry.get("plot_path", ""))
+        csv_path = str(metric_entry.get("csv_path", ""))
+        if not plot_path or not csv_path:
+            return False
+        if not os.path.isfile(plot_path) or not os.path.isfile(csv_path):
+            return False
+
+    return True
 
 
-def save_laplacian_points_csv(
+def _get_focus_metric_spec(metric_name: str) -> dict[str, str]:
+    metric_spec = FOCUS_METRIC_SPECS.get(metric_name)
+    if metric_spec is None:
+        raise ValueError(
+            f"Unsupported metric '{metric_name}'. Expected one of: {FOCUS_METRIC_ORDER}"
+        )
+    return metric_spec
+
+
+def save_focus_metric_points_csv(
     points: list[dict[str, str | float]],
     output_csv: Path,
     position_col: str,
+    metric_name: str,
 ) -> None:
+    _get_focus_metric_spec(metric_name)
     output_csv.parent.mkdir(parents=True, exist_ok=True)
     with output_csv.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.writer(handle)
-        writer.writerow(["filename", "image_path", position_col, "laplacian_variance"])
+        writer.writerow(["filename", "image_path", position_col, metric_name])
         for item in points:
             writer.writerow(
                 [
                     item["filename"],
                     item["image_path"],
                     item["position_value"],
-                    item["laplacian_variance"],
+                    item[metric_name],
                 ]
             )
 
 
-def save_laplacian_plot(
+def save_focus_metric_plot(
     points: list[dict[str, str | float]],
     output_plot: Path,
     position_col: str,
+    metric_name: str,
     show_plot: bool,
 ) -> None:
     import matplotlib.pyplot as plt
 
+    metric_spec = _get_focus_metric_spec(metric_name)
     x_values = [float(item["position_value"]) for item in points]
-    y_values = [float(item["laplacian_variance"]) for item in points]
+    y_values = [float(item[metric_name]) for item in points]
 
     fig, ax = plt.subplots(figsize=(10, 6))
     ax.scatter(x_values, y_values, s=12, alpha=0.7)
 
-    best_point = max(points, key=lambda item: float(item["laplacian_variance"]))
+    best_point = max(points, key=lambda item: float(item[metric_name]))
     ax.scatter(
         [float(best_point["position_value"])],
-        [float(best_point["laplacian_variance"])],
+        [float(best_point[metric_name])],
         marker="*",
         s=220,
         color="red",
-        label=(f"max variance @ {position_col}={float(best_point['position_value']):.4f}"),
+        label=(
+            f"max {metric_spec['score_label']} @ "
+            f"{position_col}={float(best_point['position_value']):.4f}"
+        ),
         zorder=5,
     )
 
-    ax.set_title("Laplacian Variance vs Recorded Position")
+    ax.set_title(metric_spec["plot_title"])
     ax.set_xlabel(position_col)
-    ax.set_ylabel("Laplacian variance")
+    ax.set_ylabel(metric_spec["score_label"])
     ax.grid(alpha=0.25)
     ax.legend()
     fig.tight_layout()
@@ -316,6 +373,34 @@ def save_laplacian_plot(
     if show_plot:
         plt.show()
     plt.close(fig)
+
+
+def save_laplacian_points_csv(
+    points: list[dict[str, str | float]],
+    output_csv: Path,
+    position_col: str,
+) -> None:
+    save_focus_metric_points_csv(
+        points=points,
+        output_csv=output_csv,
+        position_col=position_col,
+        metric_name="laplacian_variance",
+    )
+
+
+def save_laplacian_plot(
+    points: list[dict[str, str | float]],
+    output_plot: Path,
+    position_col: str,
+    show_plot: bool,
+) -> None:
+    save_focus_metric_plot(
+        points=points,
+        output_plot=output_plot,
+        position_col=position_col,
+        metric_name="laplacian_variance",
+        show_plot=show_plot,
+    )
 
 
 def run_laplacian_plot_from_csv(
@@ -375,20 +460,101 @@ def run_laplacian_plot_from_csv(
     }
 
 
+def run_focus_metrics_plots_from_csv(
+    csv_path: Path,
+    images_dir_arg: Optional[str],
+    position_col_arg: Optional[str],
+    median_ksize: int,
+    max_rows: Optional[int],
+    output_dir_arg: Optional[str],
+    show_plot: bool,
+) -> dict[str, object]:
+    position_col, images_dir, points = load_focus_points_from_final_csv(
+        csv_path=csv_path,
+        images_dir_arg=images_dir_arg,
+        requested_position_column=position_col_arg,
+        median_ksize=median_ksize,
+        max_rows=max_rows,
+    )
+    print(f"Using CSV: {csv_path}")
+    print(f"Using images directory: {images_dir}")
+    print(f"Using position column: {position_col}")
+
+    if not points:
+        raise ValueError("No usable rows found. Check CSV/image paths and selected columns.")
+
+    if output_dir_arg:
+        output_dir = Path(output_dir_arg).expanduser().resolve()
+    else:
+        output_dir = csv_path.parent.resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    metric_outputs: dict[str, dict[str, object]] = {}
+    for metric_name in FOCUS_METRIC_ORDER:
+        metric_spec = _get_focus_metric_spec(metric_name)
+        plot_path = output_dir / f"{metric_spec['file_stem']}.png"
+        csv_path_metric = output_dir / f"{metric_spec['file_stem']}.csv"
+
+        save_focus_metric_plot(
+            points=points,
+            output_plot=plot_path,
+            position_col=position_col,
+            metric_name=metric_name,
+            show_plot=show_plot,
+        )
+        save_focus_metric_points_csv(
+            points=points,
+            output_csv=csv_path_metric,
+            position_col=position_col,
+            metric_name=metric_name,
+        )
+
+        best_point = max(points, key=lambda item: float(item[metric_name]))
+        print(f"Saved {metric_spec['display_name']} plot: {plot_path}")
+        print(f"Saved {metric_spec['display_name']} CSV: {csv_path_metric}")
+        print(
+            f"Best {metric_spec['display_name']} candidate: "
+            f"file={best_point['filename']}, "
+            f"{position_col}={float(best_point['position_value']):.4f}, "
+            f"score={float(best_point[metric_name]):.4f}"
+        )
+
+        metric_outputs[metric_name] = {
+            "output_plot": str(plot_path),
+            "output_csv": str(csv_path_metric),
+            "best_filename": str(best_point["filename"]),
+            "best_position": float(best_point["position_value"]),
+            "best_score": float(best_point[metric_name]),
+            "points_count": len(points),
+        }
+
+    return {
+        "position_col": position_col,
+        "images_dir": str(images_dir),
+        "points_count": len(points),
+        "metrics": metric_outputs,
+    }
+
+
 def run_cli_if_requested(argv: list[str]) -> Optional[int]:
-    if "--plot-laplacian" not in argv:
+    if "--plot-laplacian" not in argv and "--plot-focus-metrics" not in argv:
         return None
 
     parser = argparse.ArgumentParser(
         description=(
-            "DataPreprocesser CLI mode. Use --plot-laplacian with a final CSV to plot "
-            "Laplacian variance against recorded position."
+            "DataPreprocesser CLI mode. Use --plot-laplacian (single metric) or "
+            "--plot-focus-metrics (Laplacian, LoG, Sobel, Gabor)."
         )
     )
     parser.add_argument(
         "--plot-laplacian",
         action="store_true",
         help="Enable Laplacian-vs-position plotting mode.",
+    )
+    parser.add_argument(
+        "--plot-focus-metrics",
+        action="store_true",
+        help="Generate Laplacian, LoG, Sobel, and Gabor plots/CSVs together.",
     )
     parser.add_argument(
         "--csv",
@@ -428,28 +594,48 @@ def run_cli_if_requested(argv: list[str]) -> Optional[int]:
         help="Optional output CSV path with computed Laplacian variance values.",
     )
     parser.add_argument(
+        "--output-dir",
+        default=None,
+        help=(
+            "Optional output directory for --plot-focus-metrics. "
+            "Defaults to the CSV parent folder."
+        ),
+    )
+    parser.add_argument(
         "--show",
         action="store_true",
         help="Display plot interactively.",
     )
     args = parser.parse_args(argv)
 
-    if not args.plot_laplacian:
+    if not args.plot_laplacian and not args.plot_focus_metrics:
         return None
     if not args.csv:
-        parser.error("--csv is required when --plot-laplacian is set.")
+        parser.error("--csv is required when --plot-laplacian or --plot-focus-metrics is set.")
 
     try:
-        run_laplacian_plot_from_csv(
-            csv_path=Path(args.csv).expanduser().resolve(),
-            images_dir_arg=args.images_dir,
-            position_col_arg=args.position_col,
-            median_ksize=args.median_ksize,
-            max_rows=args.max_rows,
-            output_plot_arg=args.output_plot,
-            output_csv_arg=args.output_csv,
-            show_plot=args.show,
-        )
+        csv_path = Path(args.csv).expanduser().resolve()
+        if args.plot_focus_metrics:
+            run_focus_metrics_plots_from_csv(
+                csv_path=csv_path,
+                images_dir_arg=args.images_dir,
+                position_col_arg=args.position_col,
+                median_ksize=args.median_ksize,
+                max_rows=args.max_rows,
+                output_dir_arg=args.output_dir,
+                show_plot=args.show,
+            )
+        if args.plot_laplacian:
+            run_laplacian_plot_from_csv(
+                csv_path=csv_path,
+                images_dir_arg=args.images_dir,
+                position_col_arg=args.position_col,
+                median_ksize=args.median_ksize,
+                max_rows=args.max_rows,
+                output_plot_arg=args.output_plot,
+                output_csv_arg=args.output_csv,
+                show_plot=args.show,
+            )
         return 0
     except Exception as exc:
         print(f"ERROR: {exc}")
@@ -835,19 +1021,19 @@ class PreprocessWorker(QObject):
                 self.log.emit(
                     f"Combined {CROPPED_CAMERA_FRAMES_DIR} folder: {combined_cropped_frames_dir}"
                 )
-            laplacian_images_dir = combined_camera_frames_dir
+            focus_images_dir = combined_camera_frames_dir
             if self.enable_cropped_tip_roi:
                 if not combined_cropped_frames_dir or not os.path.isdir(combined_cropped_frames_dir):
                     raise FileNotFoundError(
                         f"Missing {CROPPED_CAMERA_FRAMES_DIR} folder: {combined_cropped_frames_dir}"
                     )
-                laplacian_images_dir = combined_cropped_frames_dir
+                focus_images_dir = combined_cropped_frames_dir
             self.log.emit(
-                "Using cropped ROI images for Laplacian artifacts: "
-                f"{laplacian_images_dir}"
+                "Using cropped ROI images for focus-filter artifacts: "
+                f"{focus_images_dir}"
                 if self.enable_cropped_tip_roi
-                else "Using full camera_frames images for Laplacian artifacts: "
-                f"{laplacian_images_dir}"
+                else "Using full camera_frames images for focus-filter artifacts: "
+                f"{focus_images_dir}"
             )
 
             rows_hash = hash_rows(all_rows)
@@ -860,6 +1046,7 @@ class PreprocessWorker(QObject):
                 "calibration_signature": calibration_signature if self.enable_cropped_tip_roi else "",
                 "crop_size": int(self.crop_size) if self.enable_cropped_tip_roi else 0,
                 "cropped_outlier_zscore": CROPPED_OUTLIER_ZSCORE if self.enable_cropped_tip_roi else 0.0,
+                "focus_metric_names": list(FOCUS_METRIC_ORDER),
             }
             run_signature = hashlib.sha256(
                 json.dumps(signature_payload, sort_keys=True).encode("utf-8")
@@ -868,14 +1055,24 @@ class PreprocessWorker(QObject):
             if previous_state and has_reusable_artifacts(previous_state, run_signature):
                 balanced_csv_path = str(previous_state["balanced_csv_path"])
                 artifacts_dir = str(previous_state.get("artifacts_dir", os.path.dirname(balanced_csv_path)))
-                self.log.emit("Skipping balancing + Laplacian artifacts (cache hit).")
+                metric_artifacts = previous_state.get("metric_artifacts", {})
+                self.log.emit("Skipping balancing + focus-filter artifacts (cache hit).")
                 self.log.emit(f"Balanced CSV (cached): {balanced_csv_path}")
-                self.log.emit(
-                    f"Laplacian plot (cached): {previous_state.get('laplacian_plot_path', '')}"
-                )
-                self.log.emit(
-                    f"Laplacian CSV (cached): {previous_state.get('laplacian_csv_path', '')}"
-                )
+                for metric_name in FOCUS_METRIC_ORDER:
+                    metric_spec = _get_focus_metric_spec(metric_name)
+                    metric_entry = (
+                        metric_artifacts.get(metric_name, {})
+                        if isinstance(metric_artifacts, dict)
+                        else {}
+                    )
+                    self.log.emit(
+                        f"{metric_spec['display_name']} plot (cached): "
+                        f"{metric_entry.get('plot_path', '')}"
+                    )
+                    self.log.emit(
+                        f"{metric_spec['display_name']} CSV (cached): "
+                        f"{metric_entry.get('csv_path', '')}"
+                    )
             else:
                 self.log.emit("Balancing combined dataset...")
                 # balancer_z uses matplotlib; force a non-GUI backend in worker threads.
@@ -893,32 +1090,42 @@ class PreprocessWorker(QObject):
                 )
 
                 artifacts_dir = os.path.dirname(balanced_csv_path)
-                self.log.emit("Generating Laplacian-vs-position artifacts from balanced CSV...")
-                laplacian_plot_path = os.path.join(
-                    artifacts_dir,
-                    "laplacian_variance_vs_position.png",
-                )
-                laplacian_csv_path = os.path.join(
-                    artifacts_dir,
-                    "laplacian_variance_vs_position.csv",
-                )
-                laplacian_info = run_laplacian_plot_from_csv(
+                self.log.emit("Generating focus-filter artifacts from balanced CSV...")
+                focus_metrics_info = run_focus_metrics_plots_from_csv(
                     csv_path=Path(balanced_csv_path),
-                    images_dir_arg=laplacian_images_dir,
+                    images_dir_arg=focus_images_dir,
                     position_col_arg=None,
                     median_ksize=5,
                     max_rows=None,
-                    output_plot_arg=laplacian_plot_path,
-                    output_csv_arg=laplacian_csv_path,
+                    output_dir_arg=artifacts_dir,
                     show_plot=False,
                 )
-                self.log.emit(
-                    "Laplacian artifact ready: "
-                    f"{laplacian_info['output_plot']} ({laplacian_info['points_count']} points, "
-                    f"x={laplacian_info['position_col']})"
-                )
-                if laplacian_info["output_csv"]:
-                    self.log.emit(f"Laplacian values CSV: {laplacian_info['output_csv']}")
+                metric_outputs = focus_metrics_info.get("metrics", {})
+                if not isinstance(metric_outputs, dict):
+                    raise ValueError("Unexpected focus metrics output format.")
+                metric_artifacts_state: dict[str, dict[str, str]] = {}
+                for metric_name in FOCUS_METRIC_ORDER:
+                    metric_spec = _get_focus_metric_spec(metric_name)
+                    metric_info = metric_outputs.get(metric_name, {})
+                    if not isinstance(metric_info, dict):
+                        raise ValueError(f"Missing output info for metric: {metric_name}")
+                    metric_plot_path = str(metric_info.get("output_plot", ""))
+                    metric_csv_path = str(metric_info.get("output_csv", ""))
+                    metric_points_count = int(metric_info.get("points_count", 0))
+                    self.log.emit(
+                        f"{metric_spec['display_name']} artifact ready: "
+                        f"{metric_plot_path} ({metric_points_count} points, "
+                        f"x={focus_metrics_info['position_col']})"
+                    )
+                    self.log.emit(
+                        f"{metric_spec['display_name']} values CSV: {metric_csv_path}"
+                    )
+                    metric_artifacts_state[metric_name] = {
+                        "plot_path": metric_plot_path,
+                        "csv_path": metric_csv_path,
+                    }
+
+                laplacian_artifact = metric_artifacts_state.get("laplacian_variance", {})
                 self.log.emit(f"Balancing complete. Artifacts: {artifacts_dir}")
                 save_preprocess_state(
                     state_path,
@@ -927,9 +1134,10 @@ class PreprocessWorker(QObject):
                         "rows_hash": rows_hash,
                         "balanced_csv_path": balanced_csv_path,
                         "artifacts_dir": artifacts_dir,
-                        "laplacian_plot_path": laplacian_plot_path,
-                        "laplacian_csv_path": laplacian_csv_path,
-                        "laplacian_images_dir": laplacian_images_dir,
+                        "laplacian_plot_path": laplacian_artifact.get("plot_path", ""),
+                        "laplacian_csv_path": laplacian_artifact.get("csv_path", ""),
+                        "laplacian_images_dir": focus_images_dir,
+                        "metric_artifacts": metric_artifacts_state,
                     },
                 )
             self.success.emit(combined_csv_path, balanced_csv_path)
