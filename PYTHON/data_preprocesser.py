@@ -1037,6 +1037,14 @@ class PreprocessWorker(QObject):
             )
 
             rows_hash = hash_rows(all_rows)
+            normalized_session_dirs: list[str] = []
+            seen_session_dirs: set[str] = set()
+            for session_dir in self.session_dirs:
+                normalized_session_dir = os.path.normpath(os.path.abspath(session_dir))
+                if normalized_session_dir in seen_session_dirs:
+                    continue
+                seen_session_dirs.add(normalized_session_dir)
+                normalized_session_dirs.append(normalized_session_dir)
             signature_payload = {
                 "rows_hash": rows_hash,
                 "cull_limit": self.cull_limit,
@@ -1047,6 +1055,7 @@ class PreprocessWorker(QObject):
                 "crop_size": int(self.crop_size) if self.enable_cropped_tip_roi else 0,
                 "cropped_outlier_zscore": CROPPED_OUTLIER_ZSCORE if self.enable_cropped_tip_roi else 0.0,
                 "focus_metric_names": list(FOCUS_METRIC_ORDER),
+                "source_session_dirs": normalized_session_dirs,
             }
             run_signature = hashlib.sha256(
                 json.dumps(signature_payload, sort_keys=True).encode("utf-8")
@@ -1087,6 +1096,7 @@ class PreprocessWorker(QObject):
                     cap_per_bin=self.cap_per_bin,
                     seed=self.seed,
                     show_plots=False,
+                    source_session_dirs=normalized_session_dirs,
                 )
 
                 artifacts_dir = os.path.dirname(balanced_csv_path)

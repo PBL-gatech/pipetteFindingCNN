@@ -21,7 +21,14 @@ import albumentations as A
 from albumentations.pytorch import ToTensorV2
 
 # Import default transforms from utils.py
-from utils import get_train_transform, get_val_transform
+from utils import (
+    contrast_stretch_mu_2sigma_uint8,
+    get_train_transform,
+    get_val_transform,
+)
+
+
+CHANNEL_STATS_CACHE_VERSION = 1
 
 class PipetteDataset(Dataset):
     def __init__(self, image_dir, annotations, transform=None,
@@ -97,6 +104,8 @@ class PipetteDataModule:
                  split_save_path: str | None = None,
                  channel_stats_cache_path: str | None = None,
                  channel_stats_max_images: int | None = 2000,
+                 enable_contrast_stretch: bool = False,
+                 enable_aug_flip_rotate: bool = False,
                  cache_images: bool = False,
                  logger=None):
         """
@@ -113,6 +122,8 @@ class PipetteDataModule:
         split_save_path: optional path to persist the split indices (e.g., under the run folder)
         channel_stats_cache_path: optional path to cache per-channel mean/std computation
         channel_stats_max_images: optional cap on number of images to use when computing channel stats (None = use all)
+        enable_contrast_stretch: if True, apply paper-style contrast stretching before normalization
+        enable_aug_flip_rotate: if True, use expanded flip/turn train augmentation policy
         cache_images: if True, preload images into RAM (duplicates per worker, so use num_workers=0)
         logger: optional callable for progress messages (e.g., print or Qt log)
         """
@@ -130,6 +141,8 @@ class PipetteDataModule:
         self.split_save_path = split_save_path
         self.channel_stats_cache_path = channel_stats_cache_path
         self.channel_stats_max_images = channel_stats_max_images
+        self.enable_contrast_stretch = bool(enable_contrast_stretch)
+        self.enable_aug_flip_rotate = bool(enable_aug_flip_rotate)
         self.cache_images = cache_images
         self.logger = logger
 
@@ -188,18 +201,22 @@ class PipetteDataModule:
                 mean=channel_mean,
                 std=channel_std,
                 blur_prob=0.1,
+                enable_contrast_stretch=self.enable_contrast_stretch,
+                enable_aug_flip_rotate=self.enable_aug_flip_rotate,
             )
         if self.val_transform is None:
             self.val_transform = get_val_transform(
                 img_size=self.default_img_size,
                 mean=channel_mean,
                 std=channel_std,
+                enable_contrast_stretch=self.enable_contrast_stretch,
             )
         if self.test_transform is None:
             self.test_transform = get_val_transform(
                 img_size=self.default_img_size,
                 mean=channel_mean,
                 std=channel_std,
+                enable_contrast_stretch=self.enable_contrast_stretch,
             )
 
         # Create separate datasets using the provided (or default) transforms
@@ -246,12 +263,21 @@ class PipetteDataModule:
         Compute per-channel mean/std over the given annotations subset.
         Images are read as RGB, converted to float32 in [0,1].
         """
+        cache_key = {
+            "version": CHANNEL_STATS_CACHE_VERSION,
+            "enable_contrast_stretch": self.enable_contrast_stretch,
+        }
+
         # Try cache first
         if self.channel_stats_cache_path and os.path.isfile(self.channel_stats_cache_path):
             try:
                 with open(self.channel_stats_cache_path, "rb") as f:
                     cached = pickle.load(f)
-                if "mean" in cached and "std" in cached:
+                if (
+                    "mean" in cached
+                    and "std" in cached
+                    and cached.get("preprocess_key") == cache_key
+                ):
                     return cached["mean"], cached["std"]
             except Exception:
                 pass
@@ -269,7 +295,10 @@ class PipetteDataModule:
 
         for idx, (filename, _) in enumerate(subset, start=1):
             img_path = os.path.join(self.image_dir, filename)
-            img = np.array(Image.open(img_path).convert('RGB'), dtype=np.float32) / 255.0
+            img_uint8 = np.array(Image.open(img_path).convert('RGB'))
+            if self.enable_contrast_stretch:
+                img_uint8 = contrast_stretch_mu_2sigma_uint8(img_uint8)
+            img = img_uint8.astype(np.float32) / 255.0
             flat = img.reshape(-1, 3)
             sum_c += flat.sum(axis=0)
             sumsq_c += (flat ** 2).sum(axis=0)
@@ -286,7 +315,14 @@ class PipetteDataModule:
         if self.channel_stats_cache_path:
             try:
                 with open(self.channel_stats_cache_path, "wb") as f:
-                    pickle.dump({"mean": mean.tolist(), "std": std.tolist()}, f)
+                    pickle.dump(
+                        {
+                            "mean": mean.tolist(),
+                            "std": std.tolist(),
+                            "preprocess_key": cache_key,
+                        },
+                        f,
+                    )
             except Exception:
                 pass
 

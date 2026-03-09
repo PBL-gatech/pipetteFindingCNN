@@ -9,6 +9,7 @@ count, and saves a balanced CSV alongside the input.
 import os
 import time
 import threading
+from typing import Iterable
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -189,6 +190,25 @@ def build_variable_bins(
     return np.unique(np.round(edges, 6))
 
 
+def normalize_source_folders(source_session_dirs: Iterable[str] | None) -> list[str]:
+    """Normalize source folder paths while preserving input order."""
+    if source_session_dirs is None:
+        return []
+
+    normalized_folders: list[str] = []
+    seen: set[str] = set()
+    for folder in source_session_dirs:
+        folder_text = str(folder).strip()
+        if not folder_text:
+            continue
+        normalized = os.path.normpath(os.path.abspath(folder_text))
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        normalized_folders.append(normalized)
+    return normalized_folders
+
+
 def balance_defocus(
     input_path: str,
     target_col: str = "defocus_microns",
@@ -196,6 +216,7 @@ def balance_defocus(
     cap_per_bin: int = 50,
     seed: int = 42,
     show_plots: bool = False,
+    source_session_dirs: Iterable[str] | None = None,
 ) -> str:
     if threading.current_thread() is not threading.main_thread():
         try:
@@ -215,6 +236,15 @@ def balance_defocus(
     artifacts_dir = os.path.join(directory, f"{os.path.splitext(base)[0]}_sampled_{run_ts}_artifacts")
     output_path = os.path.join(artifacts_dir, base.replace(".csv", "_sampled.csv"))
     os.makedirs(artifacts_dir, exist_ok=True)
+    normalized_source_folders = normalize_source_folders(source_session_dirs)
+    source_folders_csv_path = os.path.join(artifacts_dir, "label_source_folders.csv")
+    source_folders_df = pd.DataFrame(
+        {
+            "source_folder_index": list(range(1, len(normalized_source_folders) + 1)),
+            "source_folder": normalized_source_folders,
+        }
+    )
+    source_folders_df.to_csv(source_folders_csv_path, index=False)
 
     if target_col not in source_df.columns:
         target_col = source_df.columns[-1]
@@ -383,7 +413,13 @@ def balance_defocus(
         ("rows_removed_by_cull", rows_before_cull - len(df)),
         ("rows_after_cap", len(balanced_df)),
         ("bin_count", len(bins) - 1),
+        ("label_source_folder_count", len(normalized_source_folders)),
+        ("label_source_folders_csv", source_folders_csv_path),
     ]
+    recipe_items.extend(
+        (f"label_source_folder_{idx:03d}", folder)
+        for idx, folder in enumerate(normalized_source_folders, start=1)
+    )
     recipe_df = pd.DataFrame(recipe_items, columns=["key", "value"])
     recipe_path = os.path.join(artifacts_dir, "recipe.csv")
     recipe_df.to_csv(recipe_path, index=False)
@@ -392,6 +428,7 @@ def balance_defocus(
     print(f"Bins used: {len(bins) - 1}")
     print(f"Saved balanced CSV to: {output_path}")
     print(f"Artifacts (histograms, stats) saved to: {artifacts_dir}")
+    print(f"Source folder list CSV saved to: {source_folders_csv_path}")
     print(f"Recipe saved to: {recipe_path}")
 
     return output_path

@@ -6,7 +6,7 @@ import pyqtgraph as pg
 import json
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel,
-    QPushButton, QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox,
+    QPushButton, QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox, QCheckBox,
     QFileDialog, QMessageBox, QTextEdit, QFormLayout
 )
 from PyQt5.QtCore import QThread, pyqtSignal
@@ -32,7 +32,9 @@ class TrainingWorker(QThread):
                  img_size, huber_beta, checkpoint_folder=None,
                  focus_inner_um: float = 3.0,
                  focus_weight_ratio: float | None = None,
-                 negative_weight_ratio: float = 1.0):
+                 negative_weight_ratio: float = 1.0,
+                 enable_contrast_stretch: bool = False,
+                 enable_aug_flip_rotate: bool = False):
         super().__init__()
         self.model_name = model_name
         self.train_images_dir = train_images_dir
@@ -47,6 +49,8 @@ class TrainingWorker(QThread):
         self.focus_inner_um = focus_inner_um
         self.focus_weight_ratio = focus_weight_ratio
         self.negative_weight_ratio = negative_weight_ratio
+        self.enable_contrast_stretch = bool(enable_contrast_stretch)
+        self.enable_aug_flip_rotate = bool(enable_aug_flip_rotate)
 
     def run(self):
         # Enable fast CUDA kernels when available
@@ -65,9 +69,16 @@ class TrainingWorker(QThread):
             "huber_beta": self.huber_beta,
             "focus_inner_um": self.focus_inner_um,
             "negative_weight_ratio": self.negative_weight_ratio,
+            "enable_contrast_stretch": self.enable_contrast_stretch,
+            "enable_aug_flip_rotate": self.enable_aug_flip_rotate,
         }
         run_folder = create_run_folder(self.model_name, config=config)
         self.log_signal.emit(f"Run folder created at: {run_folder}")
+        self.log_signal.emit(
+            "Preprocess toggles -> "
+            f"contrast_stretch={self.enable_contrast_stretch}, "
+            f"aug_flip_rotate={self.enable_aug_flip_rotate}"
+        )
 
         self.log_signal.emit("Setting up data module...")
         cache_images = True  # enable RAM cache for faster training
@@ -79,6 +90,8 @@ class TrainingWorker(QThread):
             split_save_path=os.path.join(run_folder, "data_splits.pkl"),
             channel_stats_cache_path=os.path.join(run_folder, "channel_stats.pkl"),
             channel_stats_max_images=2000,
+            enable_contrast_stretch=self.enable_contrast_stretch,
+            enable_aug_flip_rotate=self.enable_aug_flip_rotate,
             cache_images=cache_images,
             logger=self.log_signal.emit,
         )
@@ -109,6 +122,19 @@ class TrainingWorker(QThread):
             with open(channel_stats_path, "w") as f:
                 json.dump({"mean": data_module.channel_mean, "std": data_module.channel_std}, f, indent=2)
             self.log_signal.emit(f"Saved channel normalization stats to: {channel_stats_path}")
+
+        preprocess_cfg_path = os.path.join(run_folder, "preprocess_config.json")
+        with open(preprocess_cfg_path, "w") as f:
+            json.dump(
+                {
+                    "enable_contrast_stretch": self.enable_contrast_stretch,
+                    "enable_aug_flip_rotate": self.enable_aug_flip_rotate,
+                    "contrast_method": "mu_plus_minus_2sigma_clip_uint8",
+                },
+                f,
+                indent=2,
+            )
+        self.log_signal.emit(f"Saved preprocessing config to: {preprocess_cfg_path}")
 
         device = torch.device(self.device)
         self.log_signal.emit(f"CUDA available: {torch.cuda.is_available()} | Selected device: {device}")
@@ -243,6 +269,20 @@ class TrainingGUI(QMainWindow):
         ann_hbox.addWidget(browse_ann_btn)
         controls_form.addRow("Annotations CSV:", ann_hbox)
 
+        self.enable_contrast_checkbox = QCheckBox("Enable contrast stretching")
+        self.enable_contrast_checkbox.setChecked(False)
+        self.enable_contrast_checkbox.setToolTip(
+            "Apply per-image mu +/- 2 sigma contrast stretch before normalization."
+        )
+        controls_form.addRow(self.enable_contrast_checkbox)
+
+        self.enable_aug_flip_rotate_checkbox = QCheckBox("Enable flipping augmentation")
+        self.enable_aug_flip_rotate_checkbox.setChecked(False)
+        self.enable_aug_flip_rotate_checkbox.setToolTip(
+            "Apply random flips plus occasional 90-degree turns during training."
+        )
+        controls_form.addRow(self.enable_aug_flip_rotate_checkbox)
+
         self.model_combo = QComboBox()
         self.model_combo.addItems([
             "mobilenetv3_large_100",
@@ -362,6 +402,8 @@ class TrainingGUI(QMainWindow):
         focus_weight_ratio = None if focus_weight_ratio <= 0 else focus_weight_ratio
         negative_weight_ratio = self.negative_weight_spin.value()
         focus_inner_um = 3.0  # fixed focus band per current data balancing
+        enable_contrast_stretch = self.enable_contrast_checkbox.isChecked()
+        enable_aug_flip_rotate = self.enable_aug_flip_rotate_checkbox.isChecked()
 
         checkpoint_folder = os.path.join(os.getcwd(), "checkpoints")
         os.makedirs(checkpoint_folder, exist_ok=True)
@@ -374,6 +416,8 @@ class TrainingGUI(QMainWindow):
             focus_inner_um=focus_inner_um,
             focus_weight_ratio=focus_weight_ratio,
             negative_weight_ratio=negative_weight_ratio,
+            enable_contrast_stretch=enable_contrast_stretch,
+            enable_aug_flip_rotate=enable_aug_flip_rotate,
         )
         self.worker.update_signal.connect(self.on_update)
         self.worker.finished_signal.connect(self.on_finished)

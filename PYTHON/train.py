@@ -10,7 +10,13 @@ from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 from model import get_regression_model  # Creates model with a regression head
 from data import PipetteDataModule  # Your data module with 70/20/10 split
-from utils import plot_training_metrics, plot_regression_metrics, get_train_transform, get_val_transform
+from utils import (
+    plot_training_metrics,
+    plot_regression_metrics,
+    plot_predictions_vs_targets,
+    get_train_transform,
+    get_val_transform,
+)
 import timm
 from timm.optim import create_optimizer_v2
 from timm.scheduler import create_scheduler_v2
@@ -321,6 +327,18 @@ def test_model(model, test_loader, device, criterion, run_folder):
     ss_res = torch.sum((targets_real - preds_real) ** 2)
     ss_tot = torch.sum((targets_real - torch.mean(targets_real)) ** 2) + 1e-8
     r2 = 1 - ss_res/ss_tot
+
+    pred_vs_true_path = os.path.join(run_folder, "test_pred_vs_true.png")
+    try:
+        plot_predictions_vs_targets(
+            targets_real.numpy(),
+            preds_real.numpy(),
+            pred_vs_true_path,
+        )
+        print("Saved test prediction scatter to", pred_vs_true_path)
+    except Exception as exc:
+        print(f"Warning: failed to save test prediction scatter plot: {exc}")
+
     results = {"Test Loss": test_loss, "Test MAE": mae, "Test R2": r2.item()}
     with open(os.path.join(run_folder, "test_results.txt"), "w") as f:
         for k, v in results.items():
@@ -335,19 +353,24 @@ if __name__ == '__main__':
     model_name = "mobilenetv3_large_100"
     learning_rate = 1e-4
     num_epochs = 50
+    img_size = 224
     huber_beta = 1.0
     focus_inner_um = 3.0
     negative_weight_ratio = 2.0
+    enable_contrast_stretch = False
+    enable_aug_flip_rotate = False
     config = {
         "model_name": model_name,
         "batch_size": 32,
         "learning_rate": learning_rate,
         "num_epochs": num_epochs,
         "device": "cuda" if torch.cuda.is_available() else "cpu",
-        "img_size": 224,
+        "img_size": img_size,
         "huber_beta": huber_beta,
         "focus_inner_um": focus_inner_um,
         "negative_weight_ratio": negative_weight_ratio,
+        "enable_contrast_stretch": enable_contrast_stretch,
+        "enable_aug_flip_rotate": enable_aug_flip_rotate,
     }
     run_folder = create_run_folder(model_name, config=config)
     print("Run folder created at:", run_folder)
@@ -360,10 +383,12 @@ if __name__ == '__main__':
         val_split=0.2,
         test_split=0.1,
         seed=42,
-        default_img_size=224,
+        default_img_size=img_size,
         split_save_path=os.path.join(run_folder, "data_splits.pkl"),
         channel_stats_cache_path=os.path.join(run_folder, "channel_stats.pkl"),
         channel_stats_max_images=2000,
+        enable_contrast_stretch=enable_contrast_stretch,
+        enable_aug_flip_rotate=enable_aug_flip_rotate,
         cache_images=cache_images,
     )
     train_dataset, val_dataset, test_dataset = data_module.setup()
@@ -373,6 +398,16 @@ if __name__ == '__main__':
     if data_module.channel_mean is not None and data_module.channel_std is not None:
         with open(os.path.join(run_folder, "channel_norm.json"), "w") as f:
             json.dump({"mean": data_module.channel_mean, "std": data_module.channel_std}, f, indent=2)
+    with open(os.path.join(run_folder, "preprocess_config.json"), "w") as f:
+        json.dump(
+            {
+                "enable_contrast_stretch": enable_contrast_stretch,
+                "enable_aug_flip_rotate": enable_aug_flip_rotate,
+                "contrast_method": "mu_plus_minus_2sigma_clip_uint8",
+            },
+            f,
+            indent=2,
+        )
     
     model = get_regression_model(model_name=model_name, pretrained=True, output_dim=1)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")

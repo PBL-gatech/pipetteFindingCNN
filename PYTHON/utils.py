@@ -22,9 +22,60 @@ def _default_imagenet_stats():
     return (0.485, 0.456, 0.406), (0.229, 0.224, 0.225)
 
 
-def get_train_transform(img_size=224, mean=None, std=None, blur_prob=0.1):
+def contrast_stretch_mu_2sigma_uint8(image: np.ndarray) -> np.ndarray:
+    """
+    Paper-style per-image contrast stretch:
+      low = mu - 2*sigma
+      high = mu + 2*sigma
+      out = clip((x - low) / (high - low), 0, 1)
+    Returns uint8 image in [0, 255].
+    """
+    img = np.asarray(image)
+    if img.size == 0:
+        return img.copy()
+
+    if img.dtype != np.uint8:
+        if np.issubdtype(img.dtype, np.floating):
+            max_val = float(np.nanmax(img)) if img.size else 0.0
+            scale = 255.0 if max_val <= 1.0 else 1.0
+            img_uint8 = np.clip(img * scale, 0, 255).astype(np.uint8)
+        else:
+            img_uint8 = np.clip(img, 0, 255).astype(np.uint8)
+    else:
+        img_uint8 = img
+
+    img_float = img_uint8.astype(np.float32)
+    mu = float(np.mean(img_float))
+    sigma = float(np.std(img_float))
+
+    if not np.isfinite(mu) or not np.isfinite(sigma) or sigma <= 1e-6:
+        return img_uint8.copy()
+
+    low = mu - 2.0 * sigma
+    high = mu + 2.0 * sigma
+    if high <= low + 1e-6:
+        return img_uint8.copy()
+
+    stretched = (img_float - low) / (high - low)
+    stretched = np.clip(stretched, 0.0, 1.0)
+    return np.round(stretched * 255.0).astype(np.uint8)
+
+
+def _albumentations_contrast_stretch(image, **kwargs):
+    return contrast_stretch_mu_2sigma_uint8(image)
+
+
+def get_train_transform(
+    img_size=224,
+    mean=None,
+    std=None,
+    blur_prob=0.1,
+    enable_contrast_stretch: bool = False,
+    enable_aug_flip_rotate: bool = False,
+):
     """
     Returns an Albumentations Compose transform for training that applies:
+      - Optional contrast stretching (mu +/- 2*sigma)
       - Resize to img_size (no random crop to preserve focus context)
       - Horizontal flip and occasional 90° rotation
       - Light Gaussian blur (reduced strength / probability)
@@ -33,30 +84,60 @@ def get_train_transform(img_size=224, mean=None, std=None, blur_prob=0.1):
     """
     mean = mean if mean is not None else _default_imagenet_stats()[0]
     std = std if std is not None else _default_imagenet_stats()[1]
-    return A.Compose([
-        A.Resize(img_size, img_size),
-        A.HorizontalFlip(p=0.5),
-        A.RandomRotate90(p=0.3),
-        A.GaussianBlur(blur_limit=(3, 3), sigma_limit=(0.1, 0.5), p=blur_prob),
-        A.Normalize(mean=mean, std=std),
-        ToTensorV2()
-    ])
+    transforms = []
+    if enable_contrast_stretch:
+        transforms.append(A.Lambda(image=_albumentations_contrast_stretch))
+
+    transforms.append(A.Resize(img_size, img_size))
+
+    if enable_aug_flip_rotate:
+        transforms.extend(
+            [
+                A.HorizontalFlip(p=0.5),
+                A.VerticalFlip(p=0.5),
+                A.RandomRotate90(p=0.3),
+            ]
+        )
+    else:
+        # Keep legacy behavior when the new augmentation toggle is disabled.
+        transforms.extend(
+            [
+                A.HorizontalFlip(p=0.5),
+                A.RandomRotate90(p=0.3),
+            ]
+        )
+
+    transforms.extend(
+        [
+            A.GaussianBlur(blur_limit=(3, 3), sigma_limit=(0.1, 0.5), p=blur_prob),
+            A.Normalize(mean=mean, std=std),
+            ToTensorV2(),
+        ]
+    )
+    return A.Compose(transforms)
 
 
-def get_val_transform(img_size=224, mean=None, std=None):
+def get_val_transform(img_size=224, mean=None, std=None, enable_contrast_stretch: bool = False):
     """
     Returns an Albumentations Compose transform for validation/testing that applies:
+      - Optional contrast stretching (mu +/- 2*sigma)
       - Resize to img_size x img_size
       - Normalize with provided mean/std (defaults to ImageNet if None)
       - Conversion to a PyTorch tensor
     """
     mean = mean if mean is not None else _default_imagenet_stats()[0]
     std = std if std is not None else _default_imagenet_stats()[1]
-    return A.Compose([
-        A.Resize(img_size, img_size),
-        A.Normalize(mean=mean, std=std),
-        ToTensorV2()
-    ])
+    transforms = []
+    if enable_contrast_stretch:
+        transforms.append(A.Lambda(image=_albumentations_contrast_stretch))
+    transforms.extend(
+        [
+            A.Resize(img_size, img_size),
+            A.Normalize(mean=mean, std=std),
+            ToTensorV2(),
+        ]
+    )
+    return A.Compose(transforms)
 
 # ----------------------------
 # Plotting Utilities
@@ -98,4 +179,57 @@ def plot_regression_metrics(
     ax2.set_ylabel("R^2")
     ax2.legend()
     fig.savefig(save_path)
+    plt.close(fig)
+
+
+def plot_predictions_vs_targets(targets, predictions, save_path):
+    """
+    Save a scatter plot of predicted vs. true values with an ideal y=x line.
+    Values are expected in microns (denormalized space).
+    """
+    targets_np = np.asarray(targets, dtype=np.float32).reshape(-1)
+    preds_np = np.asarray(predictions, dtype=np.float32).reshape(-1)
+
+    if targets_np.size == 0 or preds_np.size == 0:
+        return
+
+    n = min(targets_np.size, preds_np.size)
+    targets_np = targets_np[:n]
+    preds_np = preds_np[:n]
+
+    combined = np.concatenate([targets_np, preds_np])
+    axis_min = float(np.min(combined))
+    axis_max = float(np.max(combined))
+    padding = max((axis_max - axis_min) * 0.05, 1e-6)
+    line_min = axis_min - padding
+    line_max = axis_max + padding
+
+    fig, ax = plt.subplots(figsize=(6.5, 6.5))
+    ax.scatter(
+        targets_np,
+        preds_np,
+        s=14,
+        alpha=0.65,
+        color="deepskyblue",
+        edgecolors="none",
+        label="Test samples",
+    )
+    ax.plot(
+        [line_min, line_max],
+        [line_min, line_max],
+        linestyle="--",
+        linewidth=1.6,
+        color="red",
+        label="Ideal (y=x)",
+    )
+    ax.set_xlim(line_min, line_max)
+    ax.set_ylim(line_min, line_max)
+    ax.set_aspect("equal", adjustable="box")
+    ax.set_xlabel("True z (microns)")
+    ax.set_ylabel("Predicted z (microns)")
+    ax.set_title("Test Predictions vs Ground Truth")
+    ax.grid(alpha=0.25)
+    ax.legend(loc="best")
+    fig.tight_layout()
+    fig.savefig(save_path, dpi=180)
     plt.close(fig)
