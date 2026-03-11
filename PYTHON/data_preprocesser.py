@@ -32,7 +32,14 @@ from data_preparer import (
     load_calibration_matrix_xy,
     load_movement_data,
 )
-from balancer_z import CAP_PER_BIN, CULL_LIMIT, SEED, TARGET_COL, balance_defocus
+from balancer_z import (
+    CAP_PER_BIN,
+    CULL_LIMIT,
+    MIN_LABEL_SPACING_UM,
+    SEED,
+    TARGET_COL,
+    balance_defocus,
+)
 from PyQt5.QtCore import QObject, QThread, pyqtSignal
 from PyQt5.QtWidgets import (
     QAbstractItemView,
@@ -61,7 +68,7 @@ IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".webp")
 CAMERA_FRAMES_MANIFEST = "camera_frames_manifest.csv"
 CROPPED_FRAMES_MANIFEST = "cropped_frames_manifest.csv"
 CROPPED_CAMERA_FRAMES_DIR = "cropped_camera_frames"
-DEFAULT_CROP_SIZE = 256
+DEFAULT_CROP_SIZE = 384
 PREPROCESS_STATE_FILE = "preprocess_state.json"
 CROPPED_OUTLIER_ZSCORE = 3.0
 FOCUS_METRIC_ORDER = (
@@ -654,6 +661,7 @@ class PreprocessWorker(QObject):
         output_dir: str,
         cull_limit: Optional[float],
         cap_per_bin: int,
+        min_label_spacing_um: float,
         seed: int,
         show_plots: bool,
         enable_cropped_tip_roi: bool,
@@ -665,6 +673,7 @@ class PreprocessWorker(QObject):
         self.output_dir = output_dir
         self.cull_limit = cull_limit
         self.cap_per_bin = cap_per_bin
+        self.min_label_spacing_um = float(min_label_spacing_um)
         self.seed = seed
         self.show_plots = show_plots
         self.enable_cropped_tip_roi = enable_cropped_tip_roi
@@ -1049,6 +1058,7 @@ class PreprocessWorker(QObject):
                 "rows_hash": rows_hash,
                 "cull_limit": self.cull_limit,
                 "cap_per_bin": int(self.cap_per_bin),
+                "min_label_spacing_um": float(self.min_label_spacing_um),
                 "seed": int(self.seed),
                 "use_cropped_images": bool(self.enable_cropped_tip_roi),
                 "calibration_signature": calibration_signature if self.enable_cropped_tip_roi else "",
@@ -1094,6 +1104,7 @@ class PreprocessWorker(QObject):
                     target_col=TARGET_COL,
                     cull_limit=self.cull_limit,
                     cap_per_bin=self.cap_per_bin,
+                    min_label_spacing_um=self.min_label_spacing_um,
                     seed=self.seed,
                     show_plots=False,
                     source_session_dirs=normalized_session_dirs,
@@ -1213,9 +1224,7 @@ class DataPreprocesserWindow(QMainWindow):
         options_layout.addWidget(self.enable_cull_checkbox, 1, 0)
         options_layout.addWidget(self.cull_spin, 1, 1)
 
-        self.enable_cropped_roi_checkbox = QCheckBox(
-            f"Enable calibrated tip ROI crops ({DEFAULT_CROP_SIZE}x{DEFAULT_CROP_SIZE})"
-        )
+        self.enable_cropped_roi_checkbox = QCheckBox("Enable calibrated tip ROI crops")
         self.enable_cropped_roi_checkbox.setChecked(False)
         options_layout.addWidget(self.enable_cropped_roi_checkbox, 2, 0, 1, 2)
 
@@ -1231,26 +1240,44 @@ class DataPreprocesserWindow(QMainWindow):
         options_layout.addWidget(self.calibration_path_edit, 3, 1)
         options_layout.addWidget(self.calibration_browse_button, 3, 2)
 
+        crop_size_label = QLabel("Crop size (px):")
+        self.crop_size_spin = QSpinBox()
+        self.crop_size_spin.setRange(64, 4096)
+        self.crop_size_spin.setSingleStep(16)
+        self.crop_size_spin.setValue(int(DEFAULT_CROP_SIZE))
+        self.crop_size_spin.setEnabled(False)
+        options_layout.addWidget(crop_size_label, 4, 0)
+        options_layout.addWidget(self.crop_size_spin, 4, 1)
+
+        spacing_label = QLabel("Min label spacing (um):")
+        self.min_label_spacing_spin = QDoubleSpinBox()
+        self.min_label_spacing_spin.setDecimals(3)
+        self.min_label_spacing_spin.setRange(0.0, 1000000.0)
+        self.min_label_spacing_spin.setSingleStep(0.05)
+        self.min_label_spacing_spin.setValue(float(MIN_LABEL_SPACING_UM))
+        options_layout.addWidget(spacing_label, 5, 0)
+        options_layout.addWidget(self.min_label_spacing_spin, 5, 1)
+
         cap_label = QLabel("Cap per bin:")
         self.cap_spin = QSpinBox()
         self.cap_spin.setRange(1, 1000000)
         self.cap_spin.setValue(int(CAP_PER_BIN))
-        options_layout.addWidget(cap_label, 4, 0)
-        options_layout.addWidget(self.cap_spin, 4, 1)
+        options_layout.addWidget(cap_label, 6, 0)
+        options_layout.addWidget(self.cap_spin, 6, 1)
 
         seed_label = QLabel("Random seed:")
         self.seed_spin = QSpinBox()
         self.seed_spin.setRange(0, 2147483647)
         self.seed_spin.setValue(int(SEED))
-        options_layout.addWidget(seed_label, 5, 0)
-        options_layout.addWidget(self.seed_spin, 5, 1)
+        options_layout.addWidget(seed_label, 7, 0)
+        options_layout.addWidget(self.seed_spin, 7, 1)
 
         self.show_plots_checkbox = QCheckBox(
             "Interactive plot windows (disabled during background run)"
         )
         self.show_plots_checkbox.setChecked(False)
         self.show_plots_checkbox.setEnabled(False)
-        options_layout.addWidget(self.show_plots_checkbox, 6, 0)
+        options_layout.addWidget(self.show_plots_checkbox, 8, 0)
 
         self.run_button = QPushButton("Run Preprocess + Balance")
         root_layout.addWidget(self.run_button)
@@ -1362,6 +1389,7 @@ class DataPreprocesserWindow(QMainWindow):
     def _set_crop_controls_enabled(self, enabled: bool) -> None:
         self.calibration_path_edit.setEnabled(enabled)
         self.calibration_browse_button.setEnabled(enabled)
+        self.crop_size_spin.setEnabled(enabled)
 
     def browse_output_dir(self) -> None:
         selected_dir = QFileDialog.getExistingDirectory(
@@ -1402,6 +1430,8 @@ class DataPreprocesserWindow(QMainWindow):
             self.enable_cropped_roi_checkbox,
             self.calibration_path_edit,
             self.calibration_browse_button,
+            self.crop_size_spin,
+            self.min_label_spacing_spin,
             self.cap_spin,
             self.seed_spin,
             self.show_plots_checkbox,
@@ -1430,10 +1460,12 @@ class DataPreprocesserWindow(QMainWindow):
 
         cull_limit = self.cull_spin.value() if self.enable_cull_checkbox.isChecked() else None
         cap_per_bin = self.cap_spin.value()
+        min_label_spacing_um = self.min_label_spacing_spin.value()
         seed = self.seed_spin.value()
         show_plots = False
         enable_cropped_tip_roi = self.enable_cropped_roi_checkbox.isChecked()
         calibration_path = self.calibration_path_edit.text().strip() or None
+        crop_size = self.crop_size_spin.value()
 
         if enable_cropped_tip_roi:
             if not calibration_path:
@@ -1455,9 +1487,10 @@ class DataPreprocesserWindow(QMainWindow):
         self.append_log("Starting preprocessing + balancing...")
         self.append_log(f"Sessions selected: {len(session_dirs)}")
         self.append_log(f"Combined output folder: {output_dir}")
+        self.append_log(f"Min label spacing (um): {min_label_spacing_um:.3f}")
         if enable_cropped_tip_roi:
             self.append_log(
-                f"Calibrated ROI crop enabled ({DEFAULT_CROP_SIZE}x{DEFAULT_CROP_SIZE})."
+                f"Calibrated ROI crop enabled ({crop_size}x{crop_size})."
             )
             self.append_log(f"Calibration JSON: {calibration_path}")
 
@@ -1467,11 +1500,12 @@ class DataPreprocesserWindow(QMainWindow):
             output_dir=output_dir,
             cull_limit=cull_limit,
             cap_per_bin=cap_per_bin,
+            min_label_spacing_um=min_label_spacing_um,
             seed=seed,
             show_plots=show_plots,
             enable_cropped_tip_roi=enable_cropped_tip_roi,
             calibration_path=calibration_path,
-            crop_size=DEFAULT_CROP_SIZE,
+            crop_size=crop_size,
         )
         self.worker.moveToThread(self.thread)
 

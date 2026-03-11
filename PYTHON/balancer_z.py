@@ -23,6 +23,7 @@ INNER_HALF_WIDTH = 3.0          # microns, range around 0 with fine bins
 INNER_STEP = 0.3                # microns, bin width inside [-INNER_HALF_WIDTH, INNER_HALF_WIDTH]
 OUTER_STEP = 1.0                # microns, bin width outside the inner band
 CAP_PER_BIN = 50
+MIN_LABEL_SPACING_UM = 0.25
 SEED = 42
 SHOW_PLOTS = True
 # ------------ CONFIG ------------
@@ -209,11 +210,59 @@ def normalize_source_folders(source_session_dirs: Iterable[str] | None) -> list[
     return normalized_folders
 
 
+def enforce_min_label_spacing(
+    df: pd.DataFrame,
+    target_col: str,
+    min_label_spacing_um: float,
+    seed: int,
+) -> tuple[pd.DataFrame, int]:
+    """
+    Keep rows so adjacent sorted labels are at least min_label_spacing_um apart.
+
+    The dataframe is first shuffled deterministically to break ties, then stably
+    sorted by target column. Selected rows are returned in original index order.
+    """
+    if min_label_spacing_um <= 0.0 or df.empty:
+        return df.copy(), 0
+
+    shuffled = df.sample(frac=1.0, random_state=seed)
+    sorted_df = shuffled.sort_values(by=target_col, kind="mergesort")
+
+    keep_indices: list[int] = []
+    last_anchor_value: float | None = None
+    # Treat tiny floating-point jitter as the same z-level.
+    label_tolerance_um = max(1e-6, min_label_spacing_um * 1e-6)
+    values = sorted_df[target_col].to_numpy(dtype=np.float64, copy=False)
+    for index, value in zip(sorted_df.index.tolist(), values):
+        if not np.isfinite(value):
+            keep_indices.append(index)
+            continue
+        if last_anchor_value is None:
+            keep_indices.append(index)
+            last_anchor_value = float(value)
+            continue
+
+        delta = float(value) - last_anchor_value
+        # Keep all duplicates/repeats of the currently accepted z-level.
+        if abs(delta) <= label_tolerance_um:
+            keep_indices.append(index)
+            continue
+        # Only open a new accepted z-level when spacing is met.
+        if delta >= (min_label_spacing_um - label_tolerance_um):
+            keep_indices.append(index)
+            last_anchor_value = float(value)
+
+    filtered = df.loc[keep_indices].sort_index(kind="mergesort").copy()
+    removed_count = len(df) - len(filtered)
+    return filtered, removed_count
+
+
 def balance_defocus(
     input_path: str,
     target_col: str = "defocus_microns",
     cull_limit: float | None = 80.0,
     cap_per_bin: int = 50,
+    min_label_spacing_um: float = MIN_LABEL_SPACING_UM,
     seed: int = 42,
     show_plots: bool = False,
     source_session_dirs: Iterable[str] | None = None,
@@ -308,12 +357,32 @@ def balance_defocus(
             random_state=seed,
         )
     )
+    rows_after_cap = len(capped_df)
+    sampled_df, rows_removed_by_spacing = enforce_min_label_spacing(
+        capped_df,
+        target_col=target_col,
+        min_label_spacing_um=float(min_label_spacing_um),
+        seed=seed,
+    )
+    rows_after_spacing = len(sampled_df)
+    if min_label_spacing_um > 0.0:
+        print(
+            f"Min label spacing {min_label_spacing_um}um removed "
+            f"{rows_removed_by_spacing} row(s) after capping."
+        )
+    else:
+        print("Min label spacing disabled (<= 0).")
 
     hist_after_path = os.path.join(artifacts_dir, "hist_after_balancing.png")
     save_histogram(
-        capped_df[target_col],
+        sampled_df[target_col],
         bins=bins,
-        title=f"Histogram after balancing (cap {cap_per_bin} per bin)",
+        title=(
+            f"Histogram after balancing (cap {cap_per_bin} per bin, "
+            f"min spacing {min_label_spacing_um}um)"
+            if min_label_spacing_um > 0.0
+            else f"Histogram after balancing (cap {cap_per_bin} per bin)"
+        ),
         filepath=hist_after_path,
         xlabel=target_col,
         show_plot=show_plots,
@@ -339,11 +408,16 @@ def balance_defocus(
             show_plot=show_plots,
         )
         save_projection_panels(
-            capped_df,
+            sampled_df,
             x_col=x_col,
             y_col=y_col,
             z_col=target_col,
-            title=f"Pipette position projections after balancing (cap {cap_per_bin} per bin)",
+            title=(
+                f"Pipette position projections after balancing (cap {cap_per_bin}, "
+                f"min spacing {min_label_spacing_um}um)"
+                if min_label_spacing_um > 0.0
+                else f"Pipette position projections after balancing (cap {cap_per_bin} per bin)"
+            ),
             filepath=projections_after_balancing_path,
             show_plot=show_plots,
         )
@@ -369,14 +443,14 @@ def balance_defocus(
     overall_stats = pd.DataFrame(
         {
             "before": df[target_col].describe(),
-            "after": capped_df[target_col].describe(),
+            "after": sampled_df[target_col].describe(),
         }
     )
 
     bin_counts = pd.DataFrame(
         {
             "before": df["bin"].value_counts().reindex(bin_categories, fill_value=0),
-            "after": capped_df["bin"].value_counts().reindex(bin_categories, fill_value=0),
+            "after": sampled_df["bin"].value_counts().reindex(bin_categories, fill_value=0),
         }
     )
 
@@ -384,7 +458,7 @@ def balance_defocus(
     stats_path = os.path.join(artifacts_dir, "sample_statistics.csv")
     stats_df.to_csv(stats_path)
 
-    balanced_df = capped_df.drop(columns=["bin"])
+    balanced_df = sampled_df.drop(columns=["bin"])
 
     balanced_df.to_csv(output_path, index=False)
 
@@ -407,11 +481,14 @@ def balance_defocus(
         ("inner_step", INNER_STEP),
         ("outer_step", OUTER_STEP),
         ("cap_per_bin", cap_per_bin),
+        ("min_label_spacing_um", min_label_spacing_um),
         ("seed", seed),
         ("rows_before_cull", rows_before_cull),
         ("rows_after_cull", len(df)),
         ("rows_removed_by_cull", rows_before_cull - len(df)),
-        ("rows_after_cap", len(balanced_df)),
+        ("rows_after_cap", rows_after_cap),
+        ("rows_after_spacing", rows_after_spacing),
+        ("rows_removed_by_spacing", rows_removed_by_spacing),
         ("bin_count", len(bins) - 1),
         ("label_source_folder_count", len(normalized_source_folders)),
         ("label_source_folders_csv", source_folders_csv_path),
@@ -440,6 +517,7 @@ if __name__ == "__main__":
         target_col=TARGET_COL,
         cull_limit=CULL_LIMIT,
         cap_per_bin=CAP_PER_BIN,
+        min_label_spacing_um=MIN_LABEL_SPACING_UM,
         seed=SEED,
         show_plots=SHOW_PLOTS,
     )

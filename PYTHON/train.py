@@ -166,6 +166,7 @@ def train_and_validate(model, train_loader, val_loader, device, run_folder,
     train_losses, val_losses = [], []
     mae_scores, r2_scores = [], []
     mae_scores_pos, mae_scores_neg = [], []
+    mae_scores_inner, mae_scores_outer = [], []
     epochs_list = []
 
     num_updates = 0
@@ -222,6 +223,8 @@ def train_and_validate(model, train_loader, val_loader, device, run_folder,
         mae = torch.mean(torch.abs(preds_real - targets_real)).item()
         pos_mask = targets_real >= 0
         neg_mask = targets_real < 0
+        inner_mask = torch.abs(targets_real) <= focus_inner_um
+        outer_mask = torch.abs(targets_real) > focus_inner_um
         mae_pos = (
             torch.mean(torch.abs(preds_real[pos_mask] - targets_real[pos_mask])).item()
             if torch.any(pos_mask)
@@ -232,6 +235,16 @@ def train_and_validate(model, train_loader, val_loader, device, run_folder,
             if torch.any(neg_mask)
             else float("nan")
         )
+        mae_inner = (
+            torch.mean(torch.abs(preds_real[inner_mask] - targets_real[inner_mask])).item()
+            if torch.any(inner_mask)
+            else float("nan")
+        )
+        mae_outer = (
+            torch.mean(torch.abs(preds_real[outer_mask] - targets_real[outer_mask])).item()
+            if torch.any(outer_mask)
+            else float("nan")
+        )
         ss_res = torch.sum((targets_real - preds_real) ** 2)
         ss_tot = torch.sum((targets_real - torch.mean(targets_real)) ** 2) + 1e-8
         r2 = 1 - ss_res / ss_tot
@@ -240,13 +253,16 @@ def train_and_validate(model, train_loader, val_loader, device, run_folder,
         r2_scores.append(r2.item())
         mae_scores_pos.append(mae_pos)
         mae_scores_neg.append(mae_neg)
+        mae_scores_inner.append(mae_inner)
+        mae_scores_outer.append(mae_outer)
         epochs_list.append(epoch+1)
 
         epoch_time = time.time() - epoch_start
         imgs_per_sec = len(train_loader.dataset) / epoch_time if epoch_time > 0 else 0.0
         logger(
             "Epoch {}/{}: Train Loss: {:.4f}  Val Loss: {:.4f}  MAE: {:.4f}  "
-            "MAE Neg: {:.4f}  MAE Pos: {:.4f}  R^2: {:.4f}  | imgs/sec: {:.1f}".format(
+            "MAE Neg: {:.4f}  MAE Pos: {:.4f}  MAE Inner: {:.4f}  MAE Outer: {:.4f}  "
+            "R^2: {:.4f}  | imgs/sec: {:.1f}".format(
                 epoch + 1,
                 num_epochs,
                 train_loss,
@@ -254,6 +270,8 @@ def train_and_validate(model, train_loader, val_loader, device, run_folder,
                 mae,
                 mae_neg if mae_neg == mae_neg else 0.0,
                 mae_pos if mae_pos == mae_pos else 0.0,
+                mae_inner if mae_inner == mae_inner else 0.0,
+                mae_outer if mae_outer == mae_outer else 0.0,
                 r2,
                 imgs_per_sec,
             )
@@ -269,6 +287,8 @@ def train_and_validate(model, train_loader, val_loader, device, run_folder,
                 mae,
                 mae_pos,
                 mae_neg,
+                mae_inner,
+                mae_outer,
                 r2.item(),
             )
 
@@ -286,6 +306,8 @@ def train_and_validate(model, train_loader, val_loader, device, run_folder,
             os.path.join(run_folder, "metrics.png"),
             mae_scores_pos=mae_scores_pos,
             mae_scores_neg=mae_scores_neg,
+            mae_scores_inner=mae_scores_inner,
+            mae_scores_outer=mae_scores_outer,
         )
     
     return (
@@ -297,6 +319,8 @@ def train_and_validate(model, train_loader, val_loader, device, run_folder,
         r2_scores,
         mae_scores_pos,
         mae_scores_neg,
+        mae_scores_inner,
+        mae_scores_outer,
     )
 
 # --- Testing Function ---
@@ -427,6 +451,8 @@ if __name__ == '__main__':
         r2_scores,
         _mae_scores_pos,
         _mae_scores_neg,
+        _mae_scores_inner,
+        _mae_scores_outer,
     ) = train_and_validate(
         model, train_loader, val_loader, device, run_folder, num_epochs=num_epochs,
         learning_rate=learning_rate, huber_beta=huber_beta,

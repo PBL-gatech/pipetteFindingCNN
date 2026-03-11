@@ -23,7 +23,7 @@ from converter2 import convert_checkpoint_to_torchscript
 from data import PipetteDataModule
 
 class TrainingWorker(QThread):
-    update_signal = pyqtSignal(int, float, float, float, float, float, float)
+    update_signal = pyqtSignal(int, float, float, float, float, float, float, float, float)
     finished_signal = pyqtSignal()
     log_signal = pyqtSignal(str)
 
@@ -168,11 +168,22 @@ class TrainingWorker(QThread):
             f"Dataloaders ready | train batches: {len(train_loader)} | val batches: {len(val_loader)} | test batches: {len(test_loader)} | workers: {dl_kwargs.get('num_workers',0)}"
         )
 
-        def update_callback(epoch, train_loss, val_loss, mae, mae_pos, mae_neg, r2):
-            self.update_signal.emit(epoch, train_loss, val_loss, mae, mae_pos, mae_neg, r2)
+        def update_callback(epoch, train_loss, val_loss, mae, mae_pos, mae_neg, mae_inner, mae_outer, r2):
+            self.update_signal.emit(
+                epoch,
+                train_loss,
+                val_loss,
+                mae,
+                mae_pos,
+                mae_neg,
+                mae_inner,
+                mae_outer,
+                r2,
+            )
             self.log_signal.emit(
                 f"Epoch {epoch}: Train Loss={train_loss:.4f}, Val Loss={val_loss:.4f}, "
-                f"MAE={mae:.4f}, MAE+={mae_pos:.4f}, MAE-={mae_neg:.4f}, R^2={r2:.4f}"
+                f"MAE={mae:.4f}, MAE+={mae_pos:.4f}, MAE-={mae_neg:.4f}, "
+                f"MAE(in)={mae_inner:.4f}, MAE(out)={mae_outer:.4f}, R^2={r2:.4f}"
             )
 
         self.log_signal.emit("Starting training...")
@@ -185,6 +196,8 @@ class TrainingWorker(QThread):
             r2_scores,
             mae_scores_pos,
             mae_scores_neg,
+            mae_scores_inner,
+            mae_scores_outer,
         ) = train_and_validate(
             model, train_loader, val_loader, device, run_folder,
             num_epochs=self.num_epochs, update=True, update_callback=update_callback,
@@ -276,10 +289,10 @@ class TrainingGUI(QMainWindow):
         )
         controls_form.addRow(self.enable_contrast_checkbox)
 
-        self.enable_aug_flip_rotate_checkbox = QCheckBox("Enable flipping augmentation")
+        self.enable_aug_flip_rotate_checkbox = QCheckBox("Enable 90-degree rotation augmentation")
         self.enable_aug_flip_rotate_checkbox.setChecked(False)
         self.enable_aug_flip_rotate_checkbox.setToolTip(
-            "Apply random flips plus occasional 90-degree turns during training."
+            "Apply occasional 90-degree turns in addition to default flip/HSV training augmentations."
         )
         controls_form.addRow(self.enable_aug_flip_rotate_checkbox)
 
@@ -354,6 +367,8 @@ class TrainingGUI(QMainWindow):
         self.mae_scores = []
         self.mae_scores_pos = []
         self.mae_scores_neg = []
+        self.mae_scores_inner = []
+        self.mae_scores_outer = []
         self.r2_scores = []
         self.worker = None
 
@@ -375,6 +390,8 @@ class TrainingGUI(QMainWindow):
         self.mae_scores.clear()
         self.mae_scores_pos.clear()
         self.mae_scores_neg.clear()
+        self.mae_scores_inner.clear()
+        self.mae_scores_outer.clear()
         self.r2_scores.clear()
         self.loss_plot.clear()
         self.mae_plot.clear()
@@ -424,13 +441,15 @@ class TrainingGUI(QMainWindow):
         self.worker.log_signal.connect(self.append_log)
         self.worker.start()
 
-    def on_update(self, epoch, train_loss, val_loss, mae, mae_pos, mae_neg, r2):
+    def on_update(self, epoch, train_loss, val_loss, mae, mae_pos, mae_neg, mae_inner, mae_outer, r2):
         self.epochs.append(epoch)
         self.train_losses.append(train_loss)
         self.val_losses.append(val_loss)
         self.mae_scores.append(mae)
         self.mae_scores_pos.append(mae_pos)
         self.mae_scores_neg.append(mae_neg)
+        self.mae_scores_inner.append(mae_inner)
+        self.mae_scores_outer.append(mae_outer)
         self.r2_scores.append(r2)
         self.loss_plot.clear()
         self.loss_plot.plot(self.epochs, self.train_losses, pen='c', name="Train Loss")
@@ -439,6 +458,8 @@ class TrainingGUI(QMainWindow):
         self.mae_plot.plot(self.epochs, self.mae_scores, pen=pg.mkPen('orange', width=2), name="MAE")
         self.mae_plot.plot(self.epochs, self.mae_scores_pos, pen=pg.mkPen('cyan', width=1.8), name="MAE +")
         self.mae_plot.plot(self.epochs, self.mae_scores_neg, pen=pg.mkPen('magenta', width=1.8), name="MAE -")
+        self.mae_plot.plot(self.epochs, self.mae_scores_inner, pen=pg.mkPen('y', width=1.8), name="MAE inner")
+        self.mae_plot.plot(self.epochs, self.mae_scores_outer, pen=pg.mkPen('deepskyblue', width=1.8), name="MAE outer")
         self.r2_plot.clear()
         self.r2_plot.plot(self.epochs, self.r2_scores, pen=pg.mkPen('lime', width=2))
 

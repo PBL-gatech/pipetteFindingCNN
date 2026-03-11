@@ -69,7 +69,6 @@ def get_train_transform(
     img_size=224,
     mean=None,
     std=None,
-    blur_prob=0.1,
     enable_contrast_stretch: bool = False,
     enable_aug_flip_rotate: bool = False,
 ):
@@ -77,8 +76,8 @@ def get_train_transform(
     Returns an Albumentations Compose transform for training that applies:
       - Optional contrast stretching (mu +/- 2*sigma)
       - Resize to img_size (no random crop to preserve focus context)
-      - Horizontal flip and occasional 90° rotation
-      - Light Gaussian blur (reduced strength / probability)
+      - Horizontal and vertical flips (independent, so H+V can occur)
+      - HSV jitter and optional 90-degree rotation
       - Normalize with provided mean/std (defaults to ImageNet if None)
       - Conversion to a PyTorch tensor
     """
@@ -90,26 +89,23 @@ def get_train_transform(
 
     transforms.append(A.Resize(img_size, img_size))
 
+    transforms.extend(
+        [
+            A.HorizontalFlip(p=0.5),
+            A.VerticalFlip(p=0.5),
+            A.HueSaturationValue(
+                hue_shift_limit=8,
+                sat_shift_limit=18,
+                val_shift_limit=12,
+                p=0.5,
+            ),
+        ]
+    )
     if enable_aug_flip_rotate:
-        transforms.extend(
-            [
-                A.HorizontalFlip(p=0.5),
-                A.VerticalFlip(p=0.5),
-                A.RandomRotate90(p=0.3),
-            ]
-        )
-    else:
-        # Keep legacy behavior when the new augmentation toggle is disabled.
-        transforms.extend(
-            [
-                A.HorizontalFlip(p=0.5),
-                A.RandomRotate90(p=0.3),
-            ]
-        )
+        transforms.append(A.RandomRotate90(p=0.3))
 
     transforms.extend(
         [
-            A.GaussianBlur(blur_limit=(3, 3), sigma_limit=(0.1, 0.5), p=blur_prob),
             A.Normalize(mean=mean, std=std),
             ToTensorV2(),
         ]
@@ -162,6 +158,8 @@ def plot_regression_metrics(
     save_path,
     mae_scores_pos=None,
     mae_scores_neg=None,
+    mae_scores_inner=None,
+    mae_scores_outer=None,
 ):
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
     ax1.plot(epochs, mae_scores, label="MAE", color="orange", lw=2)
@@ -169,6 +167,10 @@ def plot_regression_metrics(
         ax1.plot(epochs, mae_scores_pos, label="MAE positive", color="cyan", lw=1.8, alpha=0.9)
     if mae_scores_neg is not None:
         ax1.plot(epochs, mae_scores_neg, label="MAE negative", color="magenta", lw=1.8, alpha=0.9)
+    if mae_scores_inner is not None:
+        ax1.plot(epochs, mae_scores_inner, label="MAE inner-band", color="yellow", lw=1.8, alpha=0.9)
+    if mae_scores_outer is not None:
+        ax1.plot(epochs, mae_scores_outer, label="MAE outer-band", color="deepskyblue", lw=1.8, alpha=0.9)
     ax1.set_title("Mean Absolute Error Over Epochs")
     ax1.set_xlabel("Epoch")
     ax1.set_ylabel("MAE (microns)")
@@ -233,3 +235,4 @@ def plot_predictions_vs_targets(targets, predictions, save_path):
     fig.tight_layout()
     fig.savefig(save_path, dpi=180)
     plt.close(fig)
+

@@ -200,7 +200,6 @@ class PipetteDataModule:
                 img_size=self.default_img_size,
                 mean=channel_mean,
                 std=channel_std,
-                blur_prob=0.1,
                 enable_contrast_stretch=self.enable_contrast_stretch,
                 enable_aug_flip_rotate=self.enable_aug_flip_rotate,
             )
